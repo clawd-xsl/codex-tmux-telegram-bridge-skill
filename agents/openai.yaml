@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Tmux Telegram Bridge"
+  short_description: "Build a Telegram bridge to tmux."
+  default_prompt: "Use $codex-tmux-telegram-bridge to set up a Telegram bridge for a tmux Codex pane."
