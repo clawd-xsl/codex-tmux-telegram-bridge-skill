@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -35,6 +36,16 @@ def env_int(name: str, default: int) -> int:
         raise SystemExit(f"{name} must be an integer")
 
 
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a number")
+
+
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TMUX_TARGET = os.environ.get("TMUX_TARGET", "")
@@ -42,9 +53,24 @@ TELEGRAM_TIMEOUT = env_int("TELEGRAM_TIMEOUT", 30)
 POLL_MS = env_int("POLL_MS", 1000)
 TMUX_HISTORY_LINES = env_int("TMUX_HISTORY_LINES", 120)
 TELEGRAM_CHUNK_LIMIT = env_int("TELEGRAM_CHUNK_LIMIT", 3800)
+TELEGRAM_TYPING_ENABLED = os.environ.get("TELEGRAM_TYPING_ENABLED", "1") != "0"
+TELEGRAM_TYPING_INTERVAL = env_float("TELEGRAM_TYPING_INTERVAL", 4.0)
+TELEGRAM_TYPING_TTL = env_float("TELEGRAM_TYPING_TTL", 180.0)
 SEND_ENTER = os.environ.get("SEND_ENTER", "1") != "0"
 OUTBOUND_ENABLED = os.environ.get("OUTBOUND_ENABLED", "1") != "0"
+STRIP_TMUX_STYLES = os.environ.get("STRIP_TMUX_STYLES", "1") != "0"
 API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
+
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\)|[PX^_].*?\x1B\\)"
+)
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+BORDER_CHARS = "│┃║▌▐▏▕"
+DECORATIVE_CHARS = set(
+    "─━═│┃║┌┐└┘┏┓┗┛├┤┬┴┼╭╮╰╯╔╗╚╝╠╣╦╩╬╞╡╪╫╢╟╤╧╨╥╙╘╒╓"
+    "▁▂▃▄▅▆▇█▉▊▋▌▍▎▏▐░▒▓"
+)
+LOCK_TYPE = type(threading.Lock())
 
 
 def log(message: str) -> None:
@@ -111,6 +137,72 @@ def send_message(text: str) -> None:
         )
 
 
+def send_typing() -> None:
+    if CHAT_ID:
+        tg_call("sendChatAction", chat_id=str(CHAT_ID), action="typing")
+
+
+def state_lock(state: dict[str, Any]) -> Any | None:
+    lock = state.get("lock")
+    return lock if isinstance(lock, LOCK_TYPE) else None
+
+
+def start_typing(state: dict[str, Any]) -> None:
+    if not TELEGRAM_TYPING_ENABLED:
+        return
+    lock = state_lock(state)
+    if lock is not None:
+        with lock:
+            state["typing_until"] = time.monotonic() + TELEGRAM_TYPING_TTL
+            state["next_typing_at"] = 0.0
+    else:
+        state["typing_until"] = time.monotonic() + TELEGRAM_TYPING_TTL
+        state["next_typing_at"] = 0.0
+    maybe_send_typing(state)
+
+
+def stop_typing(state: dict[str, Any]) -> None:
+    lock = state_lock(state)
+    if lock is not None:
+        with lock:
+            state["typing_until"] = 0.0
+            state["next_typing_at"] = 0.0
+    else:
+        state["typing_until"] = 0.0
+        state["next_typing_at"] = 0.0
+
+
+def maybe_send_typing(state: dict[str, Any]) -> None:
+    if not TELEGRAM_TYPING_ENABLED:
+        return
+    now = time.monotonic()
+    should_send = False
+    lock = state_lock(state)
+    if lock is not None:
+        with lock:
+            until = float(state.get("typing_until") or 0.0)
+            if until <= now:
+                state["typing_until"] = 0.0
+                state["next_typing_at"] = 0.0
+                return
+            next_at = float(state.get("next_typing_at") or 0.0)
+            if next_at <= now:
+                state["next_typing_at"] = now + TELEGRAM_TYPING_INTERVAL
+                should_send = True
+    else:
+        until = float(state.get("typing_until") or 0.0)
+        if until <= now:
+            state["typing_until"] = 0.0
+            state["next_typing_at"] = 0.0
+            return
+        next_at = float(state.get("next_typing_at") or 0.0)
+        if next_at <= now:
+            state["next_typing_at"] = now + TELEGRAM_TYPING_INTERVAL
+            should_send = True
+    if should_send:
+        send_typing()
+
+
 def tmux(args: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["tmux", *args],
@@ -130,23 +222,25 @@ def tmux_target_exists() -> bool:
     return True
 
 
-def paste_to_tmux(text: str) -> None:
+def paste_to_tmux(text: str) -> bool:
     if not text:
-        return
+        return False
     buffer_name = "telegram-bridge"
     load = tmux(["load-buffer", "-b", buffer_name, "-"], input_text=text)
     if load.returncode != 0:
         log(f"tmux load-buffer failed: {load.stderr.strip()}")
-        return
+        return False
     paste = tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", TMUX_TARGET])
     if paste.returncode != 0:
         log(f"tmux paste-buffer failed: {paste.stderr.strip()}")
-        return
+        return False
     if SEND_ENTER:
         time.sleep(0.25)
         enter = tmux(["send-keys", "-t", TMUX_TARGET, "Enter"])
         if enter.returncode != 0:
             log(f"tmux send-keys failed: {enter.stderr.strip()}")
+            return False
+    return True
 
 
 def capture_pane() -> list[str] | None:
@@ -165,8 +259,58 @@ def overlap_index(previous: list[str], current: list[str]) -> int:
     return 0
 
 
+def apply_backspaces(text: str) -> str:
+    result: list[str] = []
+    for char in text:
+        if char == "\b":
+            if result:
+                result.pop()
+            continue
+        result.append(char)
+    return "".join(result)
+
+
+def is_decorative_line(text: str) -> bool:
+    compact = "".join(char for char in text.strip() if not char.isspace())
+    if not compact:
+        return False
+    if any(char.isalnum() for char in compact):
+        return False
+    decorative_count = sum(1 for char in compact if char in DECORATIVE_CHARS)
+    return decorative_count >= 3 and decorative_count >= len(compact) * 0.5
+
+
+def strip_wrapping_borders(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if stripped[0] not in BORDER_CHARS and stripped[-1] not in BORDER_CHARS:
+        return text.rstrip()
+    cleaned = stripped
+    while cleaned and cleaned[0] in BORDER_CHARS:
+        cleaned = cleaned[1:].lstrip()
+    while cleaned and cleaned[-1] in BORDER_CHARS:
+        cleaned = cleaned[:-1].rstrip()
+    return cleaned
+
+
+def sanitize_tmux_line(line: str) -> str | None:
+    if not STRIP_TMUX_STYLES:
+        return line.rstrip()
+    line = ANSI_ESCAPE_RE.sub("", line)
+    line = apply_backspaces(line.replace("\r", ""))
+    line = CONTROL_RE.sub("", line)
+    if is_decorative_line(line):
+        return None
+    return strip_wrapping_borders(line).rstrip()
+
+
 def format_new_output(lines: list[str]) -> str:
-    cleaned = [line.rstrip() for line in lines]
+    cleaned = []
+    for line in lines:
+        sanitized = sanitize_tmux_line(line)
+        if sanitized is not None:
+            cleaned.append(sanitized)
     while cleaned and not cleaned[0]:
         cleaned.pop(0)
     while cleaned and not cleaned[-1]:
@@ -190,6 +334,7 @@ def outbound_loop(state: dict[str, Any]) -> None:
     text = format_new_output(new_lines)
     if text:
         send_message(text)
+        stop_typing(state)
 
 
 def inbound_loop(state: dict[str, Any]) -> None:
@@ -219,11 +364,11 @@ def inbound_loop(state: dict[str, Any]) -> None:
             continue
         if isinstance(text, str) and text:
             log(f"inbound text chars={len(text)}")
-            paste_to_tmux(text)
+            if paste_to_tmux(text):
+                start_typing(state)
 
 
-def inbound_forever() -> None:
-    state: dict[str, Any] = {"offset": None}
+def inbound_forever(state: dict[str, Any]) -> None:
     while True:
         try:
             inbound_loop(state)
@@ -232,11 +377,11 @@ def inbound_forever() -> None:
             time.sleep(2)
 
 
-def outbound_forever() -> None:
-    state: dict[str, Any] = {"previous_pane": None}
+def outbound_forever(state: dict[str, Any]) -> None:
     while True:
         try:
             outbound_loop(state)
+            maybe_send_typing(state)
         except Exception as exc:
             log(f"outbound loop error: {exc}")
             time.sleep(2)
@@ -278,11 +423,20 @@ def run_bridge() -> int:
         "starting "
         f"target={TMUX_TARGET} "
         f"outbound={'on' if OUTBOUND_ENABLED else 'off'} "
-        f"send_enter={'on' if SEND_ENTER else 'off'}"
+        f"send_enter={'on' if SEND_ENTER else 'off'} "
+        f"typing={'on' if TELEGRAM_TYPING_ENABLED else 'off'} "
+        f"strip_styles={'on' if STRIP_TMUX_STYLES else 'off'}"
     )
-    inbound_thread = threading.Thread(target=inbound_forever, daemon=True)
+    shared_state: dict[str, Any] = {
+        "offset": None,
+        "previous_pane": None,
+        "typing_until": 0.0,
+        "next_typing_at": 0.0,
+        "lock": threading.Lock(),
+    }
+    inbound_thread = threading.Thread(target=inbound_forever, args=(shared_state,), daemon=True)
     inbound_thread.start()
-    outbound_forever()
+    outbound_forever(shared_state)
     return 0
 
 
