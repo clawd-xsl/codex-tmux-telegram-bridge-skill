@@ -1,18 +1,18 @@
 ---
 name: codex-tmux-telegram-bridge
-description: Build, configure, launch, and operate a Telegram-to-tmux bridge for a Codex or terminal process pane. Use when another Codex agent must set up a Telegram bot, identify a tmux pane, configure authorized chat access, start the bridge, verify inbound Telegram-to-pane input and outbound pane-to-Telegram output, or recover the bridge without relying on machine-specific paths.
+description: Build, configure, launch, and operate a Telegram bridge for a Codex process running in tmux. Use when another Codex agent must set up a Telegram bot, identify a Codex tmux pane, configure authorized chat access, start the bridge, verify inbound Telegram-to-pane input, verify outbound Codex rollout JSONL-to-Telegram output, add typing indicators, or recover the bridge without relying on machine-specific paths.
 ---
 
 # Codex Tmux Telegram Bridge
 
 ## Goal
 
-Set up a small bridge that lets an authorized Telegram chat interact with a live tmux pane:
+Set up a small bridge that lets an authorized Telegram chat interact with a live Codex process running inside tmux:
 
 - Telegram text messages are pasted into the tmux pane and submitted with Enter.
-- New tmux pane output is captured and sent back to Telegram.
-- Raw tmux/TUI style output is cleaned before it is sent to Telegram.
-- Telegram shows a typing indicator while the pane is working on a response.
+- Outbound replies come from Codex rollout JSONL, not from raw tmux screen scraping.
+- Raw tmux/TUI style output is avoided on the main outbound path.
+- Telegram shows a typing indicator while Codex is generating a response.
 - The tmux pane stays canonical and reattachable by SSH.
 - The bridge is a separate process; it should not own or kill the tmux session.
 
@@ -25,45 +25,53 @@ Data flow:
 1. User runs a terminal process inside tmux, for example Codex, a shell, or another TUI.
 2. Agent identifies the exact tmux target pane, such as `<session>:<window>.<pane>`.
 3. User creates a Telegram bot and sends it a first message.
-4. Agent records `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `TMUX_TARGET` in a private env file.
+4. Agent records `TELEGRAM_BOT_TOKEN`, `AUTHORIZED_CHAT_ID`, `TMUX_TARGET`, and optionally `CODEX_SESSIONS` in a private env file.
 5. Bridge long-polls Telegram `getUpdates`.
 6. Authorized Telegram text is injected with:
    - `tmux load-buffer`
    - `tmux paste-buffer`
    - `tmux send-keys Enter`
-7. Bridge starts Telegram `sendChatAction(action=typing)` refreshes while waiting for output.
-8. Bridge polls `tmux capture-pane` and sends newly observed pane text back to Telegram after sanitizing tmux/TUI style output.
+7. Bridge tails the newest Codex rollout JSONL under `CODEX_SESSIONS`.
+8. When rollout events show `task_started`, bridge refreshes Telegram `sendChatAction(action=typing)`.
+9. Bridge forwards structured assistant messages and structured errors from the rollout JSONL to Telegram.
 
 The bridge is intentionally simple. It does not require a web server, webhook, public port, database, or daemon manager.
 
 ## Output Cleanup
 
-Do not treat raw tmux pane bytes as a clean agent transcript. Codex and many TUIs draw status bars, boxes, spinners, cursor controls, and style sequences that are useful on a terminal but noisy in Telegram.
+Do not treat raw tmux pane bytes as the Codex transcript. Codex draws status bars, boxes, spinners, cursor controls, and style sequences that are useful on a terminal but noisy in Telegram.
 
-Required cleanup behavior for outbound pane-to-Telegram output:
+The current bridge avoids that class of bugs by reading Codex rollout JSONL for outbound messages. That JSONL contains structured `response_item` and `event_msg` records, so the bridge can forward assistant text without terminal chrome.
+
+Required outbound behavior:
+
+- Prefer Codex rollout/session JSONL for assistant text.
+- Forward only structured assistant text and structured error events.
+- Skip tool calls, tool outputs, reasoning records, token-count events, and generic TUI/status noise.
+- Do not use `tmux capture-pane` as the primary outbound source for Codex replies.
+- Ignore empty output after formatting so spinner or border-only deltas do not generate blank Telegram messages.
+
+If adapting the bridge for a non-Codex TUI and you must use raw tmux output:
 
 - Capture plain text with `tmux capture-pane -p`; do not use `-e` unless you also strip ANSI/SGR escapes.
 - If adapting from `tmux pipe-pane` or another raw terminal stream, strip ANSI CSI/OSC/control sequences before sending.
 - Drop style-only lines such as box borders, progress bars, separator rules, and other lines made mostly of `┌─┐│╭╮╰╯█░▒▓`-style drawing characters.
 - Strip wrapping border characters from content lines, for example convert `│ answer text │` to `answer text`.
-- Ignore empty output after sanitization so spinner or border-only deltas do not stop typing indicators or generate blank Telegram messages.
 - Keep real user-visible text, command output, errors, and assistant prose.
 
-For Codex specifically, prefer structured rollout/session JSONL for assistant text when that surface is available. If the bridge is intentionally generic and only reads tmux, keep a sanitizer equivalent to `scripts/bridge.py`'s `sanitize_tmux_line()` and `format_new_output()` in the outbound path.
-
-Common bug: an agent forwards every new `capture-pane` line and Telegram receives Codex chrome instead of the answer. Fix it at the outbound formatter, not by changing the tmux target or disabling the TUI.
+Common bug: an agent forwards every new `capture-pane` line and Telegram receives Codex chrome instead of the answer. For Codex, fix this by switching outbound to rollout JSONL. Only add a tmux-output sanitizer when the target process has no structured output stream.
 
 ## Typing Indicator
 
 Telegram does not keep `typing` visible permanently. The bridge must refresh it while a response is pending:
 
-1. After an authorized Telegram message is successfully pasted into tmux, call Telegram `sendChatAction` with `action=typing`.
-2. Refresh every `TELEGRAM_TYPING_INTERVAL` seconds while waiting for outbound text.
-3. Stop refreshing as soon as a real sanitized outbound message is sent.
-4. Also stop on timeout so a stuck pane does not show typing forever.
+1. Watch the rollout JSONL for `event_msg` records with `payload.type == "task_started"`.
+2. On task start, call Telegram `sendChatAction` with `action=typing`.
+3. Refresh every `TYPING_INTERVAL` seconds while the response is active.
+4. Stop refreshing as soon as structured assistant text, structured error, `task_complete`, or `turn_aborted` appears.
 5. Never send a visible "typing..." chat message; use `sendChatAction` only.
 
-The bundled script enables this by default with `TELEGRAM_TYPING_ENABLED=1`, `TELEGRAM_TYPING_INTERVAL=4.0`, and `TELEGRAM_TYPING_TTL=180.0`.
+The bundled script enables this by default with `TYPING_INTERVAL=4.0`.
 
 ## Prerequisites
 
@@ -116,8 +124,10 @@ Choose the intended chat id from the output and write a private env file:
 install -m 700 -d <private-config-dir>
 cat > <private-config-dir>/tmux-telegram-bridge.env <<'EOF'
 TELEGRAM_BOT_TOKEN=<token-from-botfather>
-TELEGRAM_CHAT_ID=<authorized-chat-id>
+AUTHORIZED_CHAT_ID=<authorized-chat-id>
 TMUX_TARGET=<session>:<window>.<pane>
+# Optional if Codex uses a non-default sessions directory:
+# CODEX_SESSIONS=<path-to-codex-sessions>
 EOF
 chmod 600 <private-config-dir>/tmux-telegram-bridge.env
 ```
@@ -168,8 +178,10 @@ Expected result: the message appears in the pane and is submitted.
 
 Outbound test:
 
-1. Make the tmux process print a short, non-secret response.
-2. Confirm the Telegram chat receives that output.
+1. Ask Codex for a short, non-secret response through Telegram.
+2. Confirm the Telegram chat shows `typing` while Codex is running.
+3. Confirm Telegram receives only the assistant text, not Codex boxes, spinners, status bars, or tool JSON.
+4. If no output arrives, confirm the rollout JSONL under `CODEX_SESSIONS` is being updated.
 
 Process check:
 
@@ -182,21 +194,16 @@ pgrep -af 'scripts/bridge.py|tmux-telegram-bridge'
 Required environment:
 
 - `TELEGRAM_BOT_TOKEN`: Telegram bot token from BotFather.
-- `TELEGRAM_CHAT_ID`: Single authorized chat id.
-- `TMUX_TARGET`: Target pane in tmux target syntax.
+- `AUTHORIZED_CHAT_ID`: Single authorized chat id. `TELEGRAM_CHAT_ID` is accepted as a compatibility alias by the bundled script.
 
 Optional environment:
 
-- `TELEGRAM_TIMEOUT`: Long-poll timeout seconds. Default: `30`.
-- `POLL_MS`: tmux capture polling interval. Default: `1000`.
-- `TMUX_HISTORY_LINES`: number of pane lines to compare. Default: `120`.
-- `SEND_ENTER`: set `0` to paste without pressing Enter. Default: `1`.
-- `OUTBOUND_ENABLED`: set `0` to disable tmux-pane output forwarding. Default: `1`.
-- `TELEGRAM_CHUNK_LIMIT`: Telegram message chunk size. Default: `3800`.
-- `STRIP_TMUX_STYLES`: set `0` to disable ANSI/control/TUI-style cleanup. Default: `1`.
-- `TELEGRAM_TYPING_ENABLED`: set `0` to disable typing indicators. Default: `1`.
-- `TELEGRAM_TYPING_INTERVAL`: seconds between typing refreshes. Default: `4.0`.
-- `TELEGRAM_TYPING_TTL`: max seconds to keep refreshing after one inbound message without real output. Default: `180.0`.
+- `TMUX_TARGET`: Target pane in tmux target syntax. Default: `codex-guardian:codex`.
+- `CODEX_SESSIONS`: Codex sessions directory. Default: `~/.codex/sessions`.
+- `TG_TIMEOUT` or `TELEGRAM_TIMEOUT`: Telegram long-poll timeout seconds. Default: `30`.
+- `POLL_MS`: rollout JSONL polling interval. Default: `500`.
+- `TYPING_INTERVAL` or `TELEGRAM_TYPING_INTERVAL`: seconds between typing refreshes. Default: `4.0`.
+- `TELEGRAM_CHUNK_LIMIT`: Telegram message chunk size. Default: `4000`.
 
 ## Recovery
 
@@ -209,30 +216,26 @@ pgrep -af 'scripts/bridge.py'
 
 Telegram reaches bot but not tmux:
 
-- Confirm `TELEGRAM_CHAT_ID` matches the sender chat.
+- Confirm `AUTHORIZED_CHAT_ID` matches the sender chat.
 - Confirm `TMUX_TARGET` still exists.
-- Confirm the target pane is not at a shell prompt that needs a different submission key.
-- Set `SEND_ENTER=0` if the target process should receive pasted text without automatic submit.
+- Confirm the target pane is a live Codex TUI and accepts pasted text followed by Enter.
 
-Tmux output does not reach Telegram:
+Codex output does not reach Telegram:
 
-- Confirm `OUTBOUND_ENABLED` is not `0`.
-- Confirm the pane output actually changes in `tmux capture-pane`.
-- Increase `TMUX_HISTORY_LINES` if output scrolls too fast.
-- Reduce `POLL_MS` only if the host can tolerate more polling.
+- Confirm `CODEX_SESSIONS` points at the directory where Codex writes rollout JSONL files.
+- Confirm the newest rollout JSONL changes when Codex responds.
+- Confirm the bridge logs `tailing <path>` for the expected JSONL file.
+- Confirm the response appears as a structured assistant `response_item`, not only as tmux screen text.
 
 Telegram receives Codex boxes, spinners, or styled junk:
 
-- Confirm `STRIP_TMUX_STYLES` is not `0`.
-- Confirm the code uses `tmux capture-pane -p`, not `tmux capture-pane -e`.
-- Add or tighten the outbound sanitizer instead of forwarding raw terminal output.
-- If Codex rollout/session JSONL is available, use that structured assistant stream for outbound text.
+- Confirm the implementation is using rollout JSONL for outbound, not `tmux capture-pane`.
+- If a local modification added raw tmux outbound, remove it for Codex or add a sanitizer as described in Output Cleanup.
 
 Typing indicator does not show:
 
-- Confirm the bridge receives the authorized Telegram message and successfully pastes it into tmux.
-- Confirm `TELEGRAM_TYPING_ENABLED` is not `0`.
-- Confirm Telegram `sendChatAction` succeeds for the same `TELEGRAM_CHAT_ID`.
+- Confirm rollout JSONL emits `task_started` for the Codex run.
+- Confirm Telegram `sendChatAction` succeeds for the same `AUTHORIZED_CHAT_ID`.
 - Remember the indicator disappears after a few seconds unless refreshed.
 
 Duplicate Telegram output:
