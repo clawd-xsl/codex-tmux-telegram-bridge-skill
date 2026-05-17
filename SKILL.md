@@ -68,8 +68,9 @@ Telegram does not keep `typing` visible permanently. The bridge must refresh it 
 1. Watch the rollout JSONL for `event_msg` records with `payload.type == "task_started"`.
 2. On task start, call Telegram `sendChatAction` with `action=typing`.
 3. Refresh every `TYPING_INTERVAL` seconds while the response is active.
-4. Stop refreshing as soon as structured assistant text, structured error, `task_complete`, or `turn_aborted` appears.
-5. Never send a visible "typing..." chat message; use `sendChatAction` only.
+4. Keep refreshing even after assistant text is sent; Codex may emit partial text before tool calls or additional final text.
+5. Stop refreshing only when the whole turn completes: `task_complete`, `turn_aborted`, or structured error/stream error.
+6. Never send a visible "typing..." chat message; use `sendChatAction` only.
 
 The bundled script enables this by default with `TYPING_INTERVAL=4.0`.
 

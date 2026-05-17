@@ -286,8 +286,7 @@ def tail_rollouts() -> None:
                         text = format_event(record)
                         if text:
                             send_message(text)
-                            typing_active = False
-                        elif stops_response(record):
+                        if stops_response(record):
                             typing_active = False
                     if typing_active:
                         maybe_send_typing()
