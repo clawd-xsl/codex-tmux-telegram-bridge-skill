@@ -1,4 +1,4 @@
 interface:
-  display_name: "Codex Tmux Telegram Bridge"
-  short_description: "Bridge Telegram to a Codex tmux pane."
-  default_prompt: "Use $codex-tmux-telegram-bridge to set up a Telegram bridge for a Codex tmux pane with rollout JSONL replies."
+  display_name: "Codex Telegram Multi-Bot Bridge"
+  short_description: "Bridge Telegram managed bots to Codex app-server sessions."
+  default_prompt: "Use $codex-telegram-multi-bot-bridge to set up a Telegram manager bot that creates session bots bound to Codex app-server threads."
