@@ -218,6 +218,75 @@ Do not forward these commands to the model as plain text. Slash commands are a
 client-side command layer and must be translated into app-server RPCs or local
 bridge behavior.
 
+## Onboarding
+
+Telegram setup has two layers: one long-lived manager bot and many managed
+session bots created from it.
+
+1. Create the manager bot in Telegram:
+   - Open `@BotFather`.
+   - Run `/newbot`.
+   - Pick a manager display name and username.
+   - Save the manager bot token locally as `TELEGRAM_MANAGER_BOT_TOKEN`.
+2. Open the manager bot's private chat and send `/start` once.
+3. Enable managed-bot creation for the manager:
+   - Open the `@BotFather` Mini App.
+   - Select the manager bot.
+   - Enable management of other bots so `getMe` reports
+     `can_manage_bots=true`.
+   - If this is not enabled, the bridge must show a private-chat prompt instead
+     of trying to create a managed bot.
+4. Prepare the Telegram group:
+   - Use a supergroup with Topics enabled.
+   - Add the manager bot to the group.
+   - The manager bot only needs to receive `/new`; it does not need Manage
+     Topics.
+5. Start the bridge locally with the manager token.
+6. In the group, run `/new` or `/new <display name>`.
+7. Use the setup card:
+   - `Name` controls the bot display name and the group autocomplete command.
+     Names must be unique.
+   - `Model`, `Effort`, `Fast`, and `Approval` configure future turns.
+   - `Create` opens the manager private chat because Telegram only allows
+     managed-bot creation from private chat.
+8. In the manager private chat, click `Create managed bot` and confirm in
+   Telegram.
+9. After creation, use the `Add to group / Grant topics` link from the manager
+   or the new session bot. The link requests `admin=manage_topics`.
+10. Confirm the new session bot joins the target group with Manage Topics
+    permission. If Telegram does not grant it automatically, promote the session
+    bot manually and enable Manage Topics.
+11. The session bot creates a dedicated forum topic and sends its ready message
+    there. Talk inside that topic to use that Codex session.
+
+For the intended Slack-like topic experience, session bots must receive normal
+group messages in their topic. If plain topic messages do not reach the bot,
+open `@BotFather`, select that session bot, and turn Group Privacy off. With
+privacy on, Telegram may only deliver commands, replies, and mentions, so users
+would need to address `@bot` explicitly.
+
+First-run checks:
+
+- `/commands` inside a session topic opens the command card for that session.
+- `Account` shows the logged-in Codex account and 5h / weekly usage limits.
+- `Session` shows the bound thread, model, effort, Fast, Plan mode, approval,
+  configured work dir, and active turn.
+- `Work Dir` changes the configured cwd for the next idle `turn/start`. It does
+  not change a turn that is already running.
+- `Goal` opens a second menu before asking for goal text.
+
+Common setup failures:
+
+- `Create` opens an empty Forward page: do not use Telegram's reply-keyboard
+  managed-bot path. Use the manager private-chat deep link and then
+  `Create managed bot`.
+- The session bot joins but no topic appears: the group is not topics-enabled or
+  the session bot lacks Manage Topics.
+- Topic text is ignored unless the bot is mentioned: disable Group Privacy for
+  that session bot in `@BotFather`.
+- Slash autocomplete is ambiguous: use the display-name-derived command, such as
+  `/raven`, or enforce unique display names when creating session bots.
+
 ## Launch
 
 Create a manager bot and enable the managed-bot flow for it in Telegram. Then
@@ -297,7 +366,9 @@ End-to-end Telegram verification:
 8. Confirm it creates a dedicated topic.
 9. Send a message in that topic and confirm Telegram shows commentary, one
    compact Activity panel, and final messages as separate rollout events.
-10. Run `/status@bot` in the group and confirm it returns the bound Codex thread.
+10. Run `/status@bot` and confirm it returns only account / usage limits.
+11. Run `/session@bot` and confirm it returns the bound Codex thread and
+    configured session settings.
 
 ## Safety Rules
 
