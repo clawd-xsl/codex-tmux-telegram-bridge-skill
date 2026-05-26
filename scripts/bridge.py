@@ -280,6 +280,16 @@ def format_unix_seconds(value: Any) -> str:
     return f"{local} ({hours // 24}d)"
 
 
+def format_epoch_ms(value: Any) -> str:
+    if value in (None, ""):
+        return "unknown"
+    try:
+        seconds = int(value) / 1000
+    except (TypeError, ValueError):
+        return str(value)
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(seconds))
+
+
 def format_reset_timestamp(value: Any) -> str | None:
     if value in (None, ""):
         return None
@@ -584,6 +594,12 @@ class TelegramBot:
         result = payload.get("result") if payload else None
         return result if isinstance(result, dict) else None
 
+    def close_forum_topic(self, chat_id: str | int, message_thread_id: int) -> dict[str, Any] | None:
+        return self.call("closeForumTopic", chat_id=chat_id, message_thread_id=message_thread_id)
+
+    def reopen_forum_topic(self, chat_id: str | int, message_thread_id: int) -> dict[str, Any] | None:
+        return self.call("reopenForumTopic", chat_id=chat_id, message_thread_id=message_thread_id)
+
     def send_message(
         self,
         chat_id: str | int,
@@ -858,6 +874,20 @@ class MultiBotBridge:
             return False
         return True
 
+    @staticmethod
+    def record_archived(record: dict[str, Any] | None) -> bool:
+        return isinstance(record, dict) and record.get("status") == "archived"
+
+    def bot_key_archived(self, bot_key: str) -> bool:
+        record = self.store.snapshot().get("bots", {}).get(bot_key)
+        return self.record_archived(record if isinstance(record, dict) else None)
+
+    def thread_archived(self, thread_id: str) -> bool:
+        for record in self.store.snapshot().get("bots", {}).values():
+            if isinstance(record, dict) and str(record.get("thread_id") or "") == thread_id:
+                return self.record_archived(record)
+        return False
+
     def run(self) -> None:
         self.app.start()
         self.migrate_session_identities()
@@ -865,6 +895,7 @@ class MultiBotBridge:
             [
                 ("new", "create a Codex session bot"),
                 ("sessions", "list managed Codex bots"),
+                ("delete", "archive a Codex session bot"),
             ]
         )
         threading.Thread(target=self.placeholder_animation_loop, name="telegram-placeholder-animation", daemon=True).start()
@@ -882,6 +913,8 @@ class MultiBotBridge:
                 name = normalize_display_name(str(record.get("name") or record.get("username") or f"Codex {bot_key}"))
                 if name:
                     record["name"] = name
+                if record.get("status") != "archived":
+                    record["status"] = "active"
                 record.setdefault("plan_mode", False)
                 base_slug = command_slug_from_name(str(record.get("command_slug") or name))
                 slug = base_slug
@@ -1064,12 +1097,18 @@ class MultiBotBridge:
     def start_session_bot_threads(self) -> None:
         snapshot = self.store.snapshot()
         for bot_key, record in snapshot["bots"].items():
+            if not isinstance(record, dict):
+                continue
+            if self.record_archived(record):
+                continue
             self.start_session_bot(bot_key, record)
 
     def ensure_existing_session_group_intros(self) -> None:
         snapshot = self.store.snapshot()
         for bot_key, record in snapshot["bots"].items():
             if not isinstance(record, dict):
+                continue
+            if self.record_archived(record):
                 continue
             self.ensure_thread_loaded(record)
             chat_id = record.get("group_chat_id")
@@ -1086,8 +1125,12 @@ class MultiBotBridge:
 
     def start_session_bot(self, bot_key: str, record: dict[str, Any]) -> None:
         with self.runtime_lock:
-            if bot_key in self.session_threads:
+            if self.record_archived(record):
                 return
+            thread = self.session_threads.get(bot_key)
+            if thread and thread.is_alive():
+                return
+            self.session_threads.pop(bot_key, None)
             token = record.get("token")
             if not token:
                 return
@@ -1158,6 +1201,18 @@ class MultiBotBridge:
             return
         if text.startswith("/sessions"):
             self.send_sessions(str(chat.get("id")))
+            return
+        if text.startswith("/delete"):
+            args = text.split(maxsplit=1)[1] if " " in text else ""
+            if args.strip():
+                bot_key = self.find_session_bot_key(args)
+                if bot_key:
+                    self.send_manager_archive_confirmation(str(chat.get("id")), bot_key)
+                else:
+                    self.manager.send_message(str(chat.get("id")), f"No session bot matched {args.strip()!r}.")
+            else:
+                self.send_sessions(str(chat.get("id")))
+            return
 
     def create_draft_from_message(self, message: dict[str, Any], args: str) -> None:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
@@ -1351,7 +1406,12 @@ class MultiBotBridge:
 
     def handle_manager_callback(self, callback: dict[str, Any]) -> None:
         data = callback.get("data")
-        if not isinstance(data, str) or not data.startswith("d:"):
+        if not isinstance(data, str):
+            return
+        if data.startswith("m:"):
+            self.handle_manager_session_callback(callback)
+            return
+        if not data.startswith("d:"):
             return
         user = callback.get("from") if isinstance(callback.get("from"), dict) else {}
         message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
@@ -1691,6 +1751,7 @@ class MultiBotBridge:
             "group_chat_id": draft.get("group_chat_id"),
             "active_turn_id": None,
             "offset": None,
+            "status": "active",
             "created_at_ms": now_ms(),
         }
 
@@ -1796,60 +1857,460 @@ class MultiBotBridge:
         if name:
             bot.call("setMyName", name=name)
 
-    def send_sessions(self, chat_id: str) -> None:
+    def send_sessions(self, chat_id: str, *, include_archived: bool = False, message_id: int | None = None) -> None:
         bots = self.store.snapshot()["bots"]
         if not bots:
-            self.manager.send_message(chat_id, "No session bots yet.")
+            text = "No session bots yet."
+            if message_id is not None:
+                self.manager.edit_message_text(chat_id, message_id, text)
+            else:
+                self.manager.send_message(chat_id, text)
             return
-        lines = ["Session bots", ""]
-        for record in bots.values():
-            slug = record.get("command_slug") or command_slug_from_name(str(record.get("name") or record.get("username") or "codex"))
-            lines.append(f"/{slug} @{record.get('username')} -> {record.get('thread_id')}")
-        self.manager.send_message(chat_id, "\n".join(lines))
+        active_items: list[tuple[str, dict[str, Any]]] = []
+        archived_items: list[tuple[str, dict[str, Any]]] = []
+        for bot_key, record in bots.items():
+            if not isinstance(record, dict):
+                continue
+            if self.record_archived(record):
+                archived_items.append((str(bot_key), record))
+            else:
+                active_items.append((str(bot_key), record))
+        visible_items = active_items + (archived_items if include_archived else [])
+        lines = [
+            "Codex Sessions",
+            "",
+            f"Active: {len(active_items)}",
+            f"Archived: {len(archived_items)}",
+            "",
+            "Archive stops the session bot and closes its Telegram topic. History is kept.",
+        ]
+        if not visible_items:
+            lines += ["", "No active sessions."]
+        rows: list[list[dict[str, Any]]] = []
+        for bot_key, record in visible_items:
+            rows.append([{"text": self.manager_session_button_label(record), "callback_data": f"m:view:{bot_key}"}])
+        if archived_items:
+            if include_archived:
+                rows.append([{"text": "Hide Archived", "callback_data": "m:list:active"}])
+            else:
+                rows.append([{"text": "Show Archived", "callback_data": "m:list:all"}])
+        markup = {"inline_keyboard": rows} if rows else None
+        if message_id is not None:
+            self.manager.edit_message_text(chat_id, message_id, "\n".join(lines), reply_markup=markup)
+        else:
+            self.manager.send_message(chat_id, "\n".join(lines), reply_markup=markup)
+
+    def manager_session_button_label(self, record: dict[str, Any]) -> str:
+        name = normalize_display_name(str(record.get("name") or record.get("username") or "Codex"))
+        username = str(record.get("username") or "")
+        state = "archived" if self.record_archived(record) else "active"
+        if username:
+            return f"{name} (@{username}) [{state}]"
+        return f"{name} [{state}]"
+
+    def find_session_bot_key(self, query: str) -> str | None:
+        target = query.strip().lstrip("@").lower()
+        if not target:
+            return None
+        snapshot = self.store.snapshot()
+        if target in snapshot.get("bots", {}):
+            return target
+        for bot_key, record in snapshot.get("bots", {}).items():
+            if not isinstance(record, dict):
+                continue
+            candidates = {
+                str(bot_key).lower(),
+                str(record.get("username") or "").lstrip("@").lower(),
+                display_name_key(str(record.get("name") or "")),
+                str(record.get("command_slug") or "").lower(),
+            }
+            if target in candidates or display_name_key(query) in candidates:
+                return str(bot_key)
+        return None
+
+    def handle_manager_session_callback(self, callback: dict[str, Any]) -> None:
+        data = str(callback.get("data") or "")
+        user = callback.get("from") if isinstance(callback.get("from"), dict) else {}
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        cb_id = str(callback.get("id"))
+        if not self.allowed(user, chat):
+            self.manager.answer_callback_query(cb_id, "Unauthorized", show_alert=True)
+            return
+        parts = data.split(":", 2)
+        if len(parts) < 2:
+            self.manager.answer_callback_query(cb_id, "Bad action", show_alert=True)
+            return
+        action = parts[1]
+        target = parts[2] if len(parts) > 2 else ""
+        chat_id = str(chat.get("id", user.get("id", "")))
+        message_id = message.get("message_id")
+        if action == "list":
+            self.manager.answer_callback_query(cb_id)
+            self.send_sessions(
+                chat_id,
+                include_archived=(target == "all"),
+                message_id=int(message_id) if message_id is not None else None,
+            )
+            return
+        bot_key = target
+        record = self.store.snapshot().get("bots", {}).get(bot_key)
+        if not isinstance(record, dict):
+            self.manager.answer_callback_query(cb_id, "Session not found", show_alert=True)
+            return
+        if message_id is None:
+            self.manager.answer_callback_query(cb_id, "Missing message context", show_alert=True)
+            return
+        if action == "view":
+            self.manager.answer_callback_query(cb_id)
+            self.edit_manager_session_card(chat_id, int(message_id), bot_key, record)
+            return
+        if action == "archive_confirm":
+            self.manager.answer_callback_query(cb_id)
+            self.edit_manager_archive_confirmation(chat_id, int(message_id), bot_key, record)
+            return
+        if action == "archive":
+            ok, text = self.archive_session_bot(bot_key, str(user.get("id") or ""))
+            self.manager.answer_callback_query(cb_id, "Archived" if ok else "Archive failed", show_alert=not ok)
+            updated = self.store.snapshot().get("bots", {}).get(bot_key)
+            if isinstance(updated, dict):
+                self.manager.edit_message_text(
+                    chat_id,
+                    int(message_id),
+                    text + "\n\n" + self.render_manager_session_card(bot_key, updated),
+                    reply_markup=self.manager_session_keyboard(bot_key, updated),
+                )
+            else:
+                self.manager.edit_message_text(chat_id, int(message_id), text)
+            return
+        if action == "restore_confirm":
+            self.manager.answer_callback_query(cb_id)
+            self.edit_manager_restore_confirmation(chat_id, int(message_id), bot_key, record)
+            return
+        if action == "restore":
+            ok, text = self.restore_session_bot(bot_key)
+            self.manager.answer_callback_query(cb_id, "Restored" if ok else "Restore failed", show_alert=not ok)
+            updated = self.store.snapshot().get("bots", {}).get(bot_key)
+            if isinstance(updated, dict):
+                self.manager.edit_message_text(
+                    chat_id,
+                    int(message_id),
+                    text + "\n\n" + self.render_manager_session_card(bot_key, updated),
+                    reply_markup=self.manager_session_keyboard(bot_key, updated),
+                )
+            else:
+                self.manager.edit_message_text(chat_id, int(message_id), text)
+            return
+        self.manager.answer_callback_query(cb_id, "Unknown action", show_alert=True)
+
+    def edit_manager_session_card(self, chat_id: str, message_id: int, bot_key: str, record: dict[str, Any]) -> None:
+        self.manager.edit_message_text(
+            chat_id,
+            message_id,
+            self.render_manager_session_card(bot_key, record),
+            reply_markup=self.manager_session_keyboard(bot_key, record),
+        )
+
+    def send_manager_archive_confirmation(self, chat_id: str, bot_key: str) -> None:
+        record = self.store.snapshot().get("bots", {}).get(bot_key)
+        if not isinstance(record, dict):
+            self.manager.send_message(chat_id, "Session not found.")
+            return
+        self.manager.send_message(
+            chat_id,
+            self.render_manager_archive_confirmation(record),
+            reply_markup=self.manager_archive_confirmation_keyboard(bot_key),
+        )
+
+    def edit_manager_archive_confirmation(
+        self,
+        chat_id: str,
+        message_id: int,
+        bot_key: str,
+        record: dict[str, Any],
+    ) -> None:
+        self.manager.edit_message_text(
+            chat_id,
+            message_id,
+            self.render_manager_archive_confirmation(record),
+            reply_markup=self.manager_archive_confirmation_keyboard(bot_key),
+        )
+
+    def edit_manager_restore_confirmation(
+        self,
+        chat_id: str,
+        message_id: int,
+        bot_key: str,
+        record: dict[str, Any],
+    ) -> None:
+        self.manager.edit_message_text(
+            chat_id,
+            message_id,
+            self.render_manager_restore_confirmation(record),
+            reply_markup=self.manager_restore_confirmation_keyboard(bot_key),
+        )
+
+    def render_manager_session_card(self, bot_key: str, record: dict[str, Any]) -> str:
+        slug = record.get("command_slug") or command_slug_from_name(str(record.get("name") or record.get("username") or "codex"))
+        thread_map = record.get("group_message_threads")
+        topic_count = len(thread_map) if isinstance(thread_map, dict) else 0
+        state = "archived" if self.record_archived(record) else "active"
+        lines = [
+            "Session",
+            "",
+            f"Name: {record.get('name') or 'Codex'}",
+            f"Bot: @{record.get('username')}",
+            f"State: {state}",
+            f"Command: /{slug}",
+            f"Thread: {record.get('thread_id')}",
+            f"Work dir: {display_path(record.get('cwd') or 'default')}",
+            f"Topics: {topic_count}",
+        ]
+        if record.get("archived_at_ms"):
+            lines.append(f"Archived at: {format_epoch_ms(record.get('archived_at_ms'))}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def render_manager_archive_confirmation(record: dict[str, Any]) -> str:
+        return "\n".join(
+            [
+                "Archive Agent?",
+                "",
+                f"Bot: @{record.get('username')}",
+                f"Name: {record.get('name') or 'Codex'}",
+                "",
+                "This will stop bridge processing for this bot and close its Telegram topic. Existing messages are kept.",
+            ]
+        )
+
+    @staticmethod
+    def render_manager_restore_confirmation(record: dict[str, Any]) -> str:
+        return "\n".join(
+            [
+                "Restore Agent?",
+                "",
+                f"Bot: @{record.get('username')}",
+                f"Name: {record.get('name') or 'Codex'}",
+                "",
+                "This will restart bridge processing for this bot and reopen its Telegram topic.",
+            ]
+        )
+
+    def manager_session_keyboard(self, bot_key: str, record: dict[str, Any]) -> dict[str, Any]:
+        rows: list[list[dict[str, Any]]] = []
+        if self.record_archived(record):
+            rows.append([{"text": "Restore", "callback_data": f"m:restore_confirm:{bot_key}"}])
+        else:
+            rows.append([{"text": "Archive", "callback_data": f"m:archive_confirm:{bot_key}"}])
+        open_url = bot_url(record.get("username"))
+        if open_url:
+            rows.append([{"text": "Open Bot", "url": open_url}])
+        rows.append([{"text": "Back", "callback_data": "m:list:active"}])
+        return {"inline_keyboard": rows}
+
+    @staticmethod
+    def manager_archive_confirmation_keyboard(bot_key: str) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "Archive Agent", "callback_data": f"m:archive:{bot_key}"}],
+                [{"text": "Cancel", "callback_data": f"m:view:{bot_key}"}],
+            ]
+        }
+
+    @staticmethod
+    def manager_restore_confirmation_keyboard(bot_key: str) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "Restore Agent", "callback_data": f"m:restore:{bot_key}"}],
+                [{"text": "Cancel", "callback_data": f"m:view:{bot_key}"}],
+            ]
+        }
+
+    def archive_session_bot(self, bot_key: str, user_id: str) -> tuple[bool, str]:
+        record = self.store.snapshot().get("bots", {}).get(bot_key)
+        if not isinstance(record, dict):
+            return False, "Session not found."
+        if self.record_archived(record):
+            return True, f"@{record.get('username')} is already archived."
+        token = record.get("token")
+        if not token:
+            return False, "Archive failed: session bot token is missing."
+        bot = self.session_bots.get(bot_key) or TelegramBot(str(token), self.timeout)
+        failures = self.apply_topic_archive_state(bot, record, close=True)
+        if failures:
+            return False, self.render_topic_archive_failure(record, failures, close=True)
+        thread_id = str(record.get("thread_id") or "")
+        active_turn_id = record.get("active_turn_id")
+        with self.runtime_lock:
+            if thread_id:
+                self.output_by_thread.pop(thread_id, None)
+        archived_at_ms = now_ms()
+
+        def mutate(data: dict[str, Any]) -> None:
+            target = data["bots"].get(bot_key)
+            if not isinstance(target, dict):
+                return
+            target["status"] = "archived"
+            target["archived_at_ms"] = archived_at_ms
+            target["archived_by_user_id"] = user_id
+            target["active_turn_id"] = None
+
+        self.store.update(mutate)
+        if thread_id and active_turn_id:
+            try:
+                self.app.request("turn/interrupt", {"threadId": thread_id, "turnId": active_turn_id}, timeout=30)
+            except Exception as exc:
+                log(f"archive interrupt failed for {bot_key}: {exc}")
+        try:
+            self.clear_session_bot_commands(bot)
+        except Exception as exc:
+            log(f"clear archived bot commands failed for {bot_key}: {exc}")
+        return True, f"Archived @{record.get('username')}. Its Telegram topic is closed and the Codex thread is kept."
+
+    def restore_session_bot(self, bot_key: str) -> tuple[bool, str]:
+        record = self.store.snapshot().get("bots", {}).get(bot_key)
+        if not isinstance(record, dict):
+            return False, "Session not found."
+        if not self.record_archived(record):
+            return True, f"@{record.get('username')} is already active."
+        token = record.get("token")
+        if not token:
+            return False, "Restore failed: session bot token is missing."
+        bot = self.session_bots.get(bot_key) or TelegramBot(str(token), self.timeout)
+        failures = self.apply_topic_archive_state(bot, record, close=False)
+        if failures:
+            return False, self.render_topic_archive_failure(record, failures, close=False)
+        restored_at_ms = now_ms()
+
+        def mutate(data: dict[str, Any]) -> None:
+            target = data["bots"].get(bot_key)
+            if not isinstance(target, dict):
+                return
+            target["status"] = "active"
+            target["restored_at_ms"] = restored_at_ms
+            target.pop("archived_at_ms", None)
+            target.pop("archived_by_user_id", None)
+
+        self.store.update(mutate)
+        updated = self.store.snapshot().get("bots", {}).get(bot_key)
+        if isinstance(updated, dict):
+            self.configure_session_bot(bot_key, updated, bot=bot)
+            self.start_session_bot(bot_key, updated)
+        return True, f"Restored @{record.get('username')}. Its Telegram topic is open again."
+
+    def apply_topic_archive_state(self, bot: TelegramBot, record: dict[str, Any], *, close: bool) -> list[str]:
+        thread_map = record.get("group_message_threads")
+        if not isinstance(thread_map, dict) or not thread_map:
+            return []
+        failures: list[str] = []
+        for chat_id, raw_thread_id in thread_map.items():
+            try:
+                thread_id = int(raw_thread_id)
+            except (TypeError, ValueError):
+                failures.append(f"{chat_id}: invalid topic id {raw_thread_id!r}")
+                continue
+            payload = bot.close_forum_topic(chat_id, thread_id) if close else bot.reopen_forum_topic(chat_id, thread_id)
+            if self.topic_operation_ok(payload, close=close):
+                continue
+            failures.append(f"{chat_id}/{thread_id}: {self.telegram_failure_description(payload)}")
+        return failures
+
+    @staticmethod
+    def topic_operation_ok(payload: dict[str, Any] | None, *, close: bool) -> bool:
+        if isinstance(payload, dict) and payload.get("ok") is True:
+            return True
+        description = str((payload or {}).get("description") or "").lower()
+        if close:
+            return "topic_closed" in description or "already closed" in description or "not modified" in description
+        return "not closed" in description or "already open" in description or "not modified" in description
+
+    @staticmethod
+    def telegram_failure_description(payload: dict[str, Any] | None) -> str:
+        if not isinstance(payload, dict):
+            return "no response from Telegram"
+        return str(payload.get("description") or payload)
+
+    def render_topic_archive_failure(self, record: dict[str, Any], failures: list[str], *, close: bool) -> str:
+        action = "close" if close else "reopen"
+        lines = [
+            f"Could not {action} the Telegram topic for @{record.get('username')}.",
+            "",
+            "Telegram returned:",
+        ]
+        lines.extend(f"- {failure}" for failure in failures[:5])
+        if len(failures) > 5:
+            lines.append(f"- ... {len(failures) - 5} more")
+        lines += [
+            "",
+            f"Grant @{record.get('username')} admin permission with Manage Topics, then try again.",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def clear_session_bot_commands(bot: TelegramBot) -> None:
+        bot.set_my_commands([], scope={"type": "default"})
+        bot.set_my_commands([], scope={"type": "all_private_chats"})
+        bot.set_my_commands([], scope={"type": "all_group_chats"})
+        bot.set_my_commands([], scope={"type": "all_chat_administrators"})
 
     def session_poll_loop(self, bot_key: str, bot: TelegramBot) -> None:
         me = bot.get_me() or {}
         username = str(me.get("username") or "")
         log(f"session bot polling @{username or bot_key}")
-        while True:
-            snapshot = self.store.snapshot()
-            record = snapshot["bots"].get(bot_key)
-            if not isinstance(record, dict):
-                return
-            offset = record.get("offset")
-            updates = bot.get_updates(offset, ["message", "callback_query", "my_chat_member"])
-            if not updates or not updates.get("ok"):
-                time.sleep(1)
-                continue
-            for update in updates.get("result", []):
-                if not isinstance(update, dict) or "update_id" not in update:
+        try:
+            while True:
+                snapshot = self.store.snapshot()
+                record = snapshot["bots"].get(bot_key)
+                if not isinstance(record, dict):
+                    return
+                if self.record_archived(record):
+                    log(f"session bot @{username or bot_key} archived; stopping poll loop")
+                    return
+                offset = record.get("offset")
+                updates = bot.get_updates(offset, ["message", "callback_query", "my_chat_member"])
+                if not updates or not updates.get("ok"):
+                    time.sleep(1)
                     continue
-                offset = int(update["update_id"]) + 1
-                self.store.update(lambda data: data["bots"][bot_key].update({"offset": offset}))
-                callback = update.get("callback_query")
-                if isinstance(callback, dict):
-                    try:
-                        self.handle_session_callback(bot_key, bot, callback)
-                    except Exception as exc:
-                        log(f"session bot {bot_key} callback error: {exc}")
-                    continue
-                member_update = update.get("my_chat_member")
-                if isinstance(member_update, dict):
-                    try:
-                        self.handle_session_member_update(bot_key, bot, member_update)
-                    except Exception as exc:
-                        log(f"session bot {bot_key} member update error: {exc}")
-                message = update.get("message")
-                if isinstance(message, dict):
-                    try:
-                        self.handle_session_message(bot_key, bot, username, message)
-                    except Exception as exc:
-                        log(f"session bot {bot_key} message error: {exc}")
+                for update in updates.get("result", []):
+                    if not isinstance(update, dict) or "update_id" not in update:
+                        continue
+                    offset = int(update["update_id"]) + 1
+                    self.store.update(lambda data: data["bots"][bot_key].update({"offset": offset}))
+                    if self.bot_key_archived(bot_key):
+                        continue
+                    callback = update.get("callback_query")
+                    if isinstance(callback, dict):
+                        try:
+                            self.handle_session_callback(bot_key, bot, callback)
+                        except Exception as exc:
+                            log(f"session bot {bot_key} callback error: {exc}")
+                        continue
+                    member_update = update.get("my_chat_member")
+                    if isinstance(member_update, dict):
+                        try:
+                            self.handle_session_member_update(bot_key, bot, member_update)
+                        except Exception as exc:
+                            log(f"session bot {bot_key} member update error: {exc}")
+                    message = update.get("message")
+                    if isinstance(message, dict):
+                        try:
+                            self.handle_session_message(bot_key, bot, username, message)
+                        except Exception as exc:
+                            log(f"session bot {bot_key} message error: {exc}")
+        finally:
+            with self.runtime_lock:
+                if self.session_bots.get(bot_key) is bot:
+                    self.session_bots.pop(bot_key, None)
+                current = threading.current_thread()
+                if self.session_threads.get(bot_key) is current:
+                    self.session_threads.pop(bot_key, None)
 
     def handle_session_message(self, bot_key: str, bot: TelegramBot, bot_username: str, message: dict[str, Any]) -> None:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         user = message.get("from") if isinstance(message.get("from"), dict) else {}
         if not self.allowed(user, chat):
+            return
+        if self.bot_key_archived(bot_key):
             return
         if self.message_added_this_bot(bot_key, message):
             self.send_group_intro(bot_key, bot, chat, message.get("message_thread_id"))
@@ -1875,6 +2336,9 @@ class MultiBotBridge:
     def handle_session_callback(self, bot_key: str, bot: TelegramBot, callback: dict[str, Any]) -> None:
         data = callback.get("data")
         if not isinstance(data, str):
+            return
+        if self.bot_key_archived(bot_key):
+            bot.answer_callback_query(str(callback.get("id")), "This session is archived.", show_alert=True)
             return
         if data.startswith("cwd:"):
             self.handle_cwd_browser_callback(bot_key, bot, callback)
@@ -2689,6 +3153,8 @@ class MultiBotBridge:
         for bot_key, record in self.store.snapshot().get("bots", {}).items():
             if not isinstance(record, dict):
                 continue
+            if self.record_archived(record):
+                continue
             thread_map = record.get("group_message_threads")
             if not isinstance(thread_map, dict):
                 continue
@@ -2713,6 +3179,8 @@ class MultiBotBridge:
         return False
 
     def handle_session_member_update(self, bot_key: str, bot: TelegramBot, update: dict[str, Any]) -> None:
+        if self.bot_key_archived(bot_key):
+            return
         new_member = update.get("new_chat_member") if isinstance(update.get("new_chat_member"), dict) else {}
         user = new_member.get("user") if isinstance(new_member.get("user"), dict) else {}
         if str(user.get("id", "")) != bot_key:
@@ -2738,6 +3206,8 @@ class MultiBotBridge:
     ) -> None:
         record = self.store.snapshot()["bots"].get(bot_key)
         if not isinstance(record, dict):
+            return
+        if self.record_archived(record):
             return
         chat_id = str(chat.get("id", ""))
         if not chat_id:
@@ -2874,6 +3344,8 @@ class MultiBotBridge:
     ) -> None:
         record = self.store.snapshot()["bots"].get(bot_key)
         if not isinstance(record, dict):
+            return
+        if self.record_archived(record):
             return
         chat_id, thread_id = msg_chat_id(message), record["thread_id"]
         message_thread_id = message.get("message_thread_id")
@@ -3342,6 +3814,10 @@ class MultiBotBridge:
             return
         thread_id = str(params.get("threadId") or "")
         if not thread_id:
+            return
+        if self.thread_archived(thread_id):
+            if method == "turn/completed":
+                self.set_active_turn_by_thread(thread_id, None)
             return
         if method == "turn/started":
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
