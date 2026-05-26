@@ -2117,6 +2117,7 @@ class MultiBotBridge:
         state = "archived" if self.record_archived(record) else "active"
         if self.record_takeover_active(record):
             state = "CLI takeover"
+        pending_cwd = str(record.get("pending_cwd") or "").strip()
         lines = [
             "Session",
             "",
@@ -2125,9 +2126,11 @@ class MultiBotBridge:
             f"State: {state}",
             f"Command: /{slug}",
             f"Thread: {record.get('thread_id')}",
-            f"Work dir: {display_path(record.get('cwd') or 'default')}",
+            f"Codex cwd: {display_path(record.get('cwd') or 'default')}",
             f"Topics: {topic_count}",
         ]
+        if pending_cwd:
+            lines.append(f"Pending cwd: {display_path(pending_cwd)}")
         takeover = record.get("takeover") if isinstance(record.get("takeover"), dict) else {}
         if self.record_takeover_active(record):
             queued = takeover.get("queued_messages") if isinstance(takeover.get("queued_messages"), list) else []
@@ -2849,6 +2852,10 @@ class MultiBotBridge:
         slug = record.get("command_slug") or command_slug_from_name(str(record.get("name") or record.get("username") or "codex"))
         plan_label = "ON - next idle turn uses Plan mode" if record.get("plan_mode") else "off - normal chat mode"
         takeover_label = "active - finish in CLI, then Resume Telegram" if self.record_takeover_active(record) else "off"
+        pending_cwd = str(record.get("pending_cwd") or "").strip()
+        cwd_label = display_path(record.get("cwd") or "default")
+        if pending_cwd:
+            cwd_label = f"{cwd_label} (pending: {display_path(pending_cwd)})"
         return "\n".join(
             [
                 "Codex Commands",
@@ -2859,7 +2866,7 @@ class MultiBotBridge:
                 f"Effort: {record.get('effort') or 'default'}",
                 f"Fast: {'on' if record.get('fast') else 'off'}",
                 f"Plan mode: {plan_label}",
-                f"Current work dir: {display_path(record.get('cwd') or 'default')}",
+                f"Codex cwd: {cwd_label}",
                 f"CLI takeover: {takeover_label}",
             ]
         )
@@ -3057,7 +3064,7 @@ class MultiBotBridge:
         record: dict[str, Any],
     ) -> None:
         browser_id = rand_suffix(6)
-        start_path = str(record.get("cwd") or os.path.expanduser("~"))
+        start_path = str(record.get("pending_cwd") or record.get("cwd") or os.path.expanduser("~"))
         start_path = normalize_cwd_path(start_path)
         self.store.update(
             lambda data: data["path_browsers"].__setitem__(
@@ -3128,10 +3135,23 @@ class MultiBotBridge:
             if error:
                 bot.answer_callback_query(cb_id, error, show_alert=True)
                 return
-            self.update_bot_setting(bot_key, "cwd", path)
+            self.set_pending_cwd(bot_key, path)
+            updated = self.store.snapshot().get("bots", {}).get(bot_key, record)
+            record = updated if isinstance(updated, dict) else record
             self.store.update(lambda data: data["path_browsers"].pop(browser_id, None))
-            bot.answer_callback_query(cb_id, "Work dir updated")
-            bot.edit_message_text(chat_id, message_id, f"Work dir set:\n{display_path(path)}", reply_markup=self.session_back_keyboard(bot_key))
+            bot.answer_callback_query(cb_id, "Work dir queued")
+            bot.edit_message_text(
+                chat_id,
+                message_id,
+                "\n".join(
+                    [
+                        "Work dir queued.",
+                        "",
+                        f"Next idle Codex turn will change cwd to: {display_path(path)}",
+                    ]
+                ),
+                reply_markup=self.session_back_keyboard(bot_key),
+            )
             return
         if action == "up":
             path = os.path.dirname(path.rstrip(os.sep)) or os.sep
@@ -3187,11 +3207,14 @@ class MultiBotBridge:
             "Working Directory",
             "",
             f"Bot: @{record.get('username')}",
-            f"Current work dir: {display_path(record.get('cwd') or 'default')}",
+            f"Codex cwd: {display_path(record.get('cwd') or 'default')}",
             f"Browsing: {display_path(path)}",
             "",
             "Choose a folder below, then tap Use This Folder.",
         ]
+        pending_cwd = str(record.get("pending_cwd") or "").strip()
+        if pending_cwd:
+            text_lines.insert(4, f"Pending cwd: {display_path(pending_cwd)}")
         if error:
             text_lines += ["", f"Error: {error}"]
         elif not dirs:
@@ -3363,8 +3386,12 @@ class MultiBotBridge:
                 bot.send_message(chat_id, f"Work dir update failed: {error}", message_thread_id=message_thread_id)
                 return True
             self.store.update(lambda data: data["pending_session_inputs"].pop(pending_key, None))
-            self.update_bot_setting(bot_key, "cwd", cwd)
-            bot.send_message(chat_id, f"Work dir: {display_path(cwd)}", message_thread_id=message_thread_id)
+            self.set_pending_cwd(bot_key, cwd)
+            bot.send_message(
+                chat_id,
+                f"Work dir queued for the next idle Codex turn: {display_path(cwd)}",
+                message_thread_id=message_thread_id,
+            )
             return True
         return False
 
@@ -3872,8 +3899,12 @@ class MultiBotBridge:
             if error:
                 bot.send_message(chat_id, f"Work dir update failed: {error}", message_thread_id=message_thread_id)
                 return
-            self.update_bot_setting(bot_key, "cwd", cwd)
-            bot.send_message(chat_id, f"Work dir: {display_path(cwd)}", message_thread_id=message_thread_id)
+            self.set_pending_cwd(bot_key, cwd)
+            bot.send_message(
+                chat_id,
+                f"Work dir queued for the next idle Codex turn: {display_path(cwd)}",
+                message_thread_id=message_thread_id,
+            )
         elif command == "goal":
             self.handle_goal_command(bot_key, bot, chat_id, message_thread_id, thread_id, args)
         elif command == "compact":
@@ -3929,6 +3960,24 @@ class MultiBotBridge:
 
     def update_bot_setting(self, bot_key: str, key: str, value: Any) -> None:
         self.store.update(lambda data: data["bots"][bot_key].update({key: value}))
+
+    def set_pending_cwd(self, bot_key: str, cwd: str) -> None:
+        self.store.update(lambda data: data["bots"][bot_key].update({"pending_cwd": cwd}))
+
+    def mark_pending_cwd_applied(self, bot_key: str, cwd: str | None) -> None:
+        if not cwd:
+            return
+
+        def mutate(data: dict[str, Any]) -> None:
+            target = data["bots"].get(bot_key)
+            if not isinstance(target, dict):
+                return
+            target["cwd"] = cwd
+            target["cwd_synced_from_tg_at_ms"] = now_ms()
+            if target.get("pending_cwd") == cwd:
+                target.pop("pending_cwd", None)
+
+        self.store.update(mutate)
 
     def read_thread_goal(self, thread_id: str) -> Any:
         result = self.app.request("thread/goal/get", {"threadId": thread_id}, timeout=30)
@@ -4095,6 +4144,7 @@ class MultiBotBridge:
             if target.get("cwd") != normalized:
                 target["cwd"] = normalized
                 target["cwd_synced_from_cli_at_ms"] = now_ms()
+            target.pop("pending_cwd", None)
 
         self.store.update(mutate)
         return normalized
@@ -4694,6 +4744,7 @@ class MultiBotBridge:
             "threadId": thread_id,
             "input": input_items if input_items is not None else text_input(text),
         }
+        applied_pending_cwd: str | None = None
         try:
             self.ensure_thread_loaded(record)
             record = self.store.snapshot()["bots"].get(bot_key)
@@ -4711,7 +4762,7 @@ class MultiBotBridge:
             else:
                 model = record.get("model")
                 effort = record.get("effort")
-                cwd = record.get("cwd")
+                cwd = str(record.get("pending_cwd") or "").strip()
                 params["serviceTier"] = self.fast_service_tier_for_model(str(model or "default")) if record.get("fast") else None
                 if record.get("plan_mode"):
                     params["collaborationMode"] = self.plan_collaboration_mode(record)
@@ -4721,7 +4772,8 @@ class MultiBotBridge:
                     params["effort"] = effort
                 if cwd:
                     params["cwd"] = cwd
-                log(f"session bot {bot_key} starting Codex turn thread={thread_id} input_items={len(params['input'])} cwd={cwd or 'default'}")
+                    applied_pending_cwd = cwd
+                log(f"session bot {bot_key} starting Codex turn thread={thread_id} input_items={len(params['input'])} cwd={cwd or 'codex-current'}")
                 result = self.app.request("turn/start", params, timeout=60)
                 turn = result.get("turn") if isinstance(result, dict) else None
                 turn_id = turn.get("id") if isinstance(turn, dict) else None
@@ -4744,6 +4796,7 @@ class MultiBotBridge:
             return
         log(f"session bot {bot_key} Codex turn accepted thread={thread_id} turn={turn_id}")
         self.store.update(lambda data: data["bots"][bot_key].update({"active_turn_id": turn_id}))
+        self.mark_pending_cwd_applied(bot_key, applied_pending_cwd)
         with self.runtime_lock:
             output = self.output_by_thread.get(thread_id)
             if output:
@@ -4810,6 +4863,8 @@ class MultiBotBridge:
         slug = record.get("command_slug") or command_slug_from_name(str(record.get("name") or record.get("username") or "codex"))
         thread_status = "unknown"
         active_flags: list[Any] = []
+        codex_cwd = str(record.get("cwd") or "").strip()
+        pending_cwd = str(record.get("pending_cwd") or "").strip()
         try:
             thread_result = self.app.request("thread/read", {"threadId": record.get("thread_id"), "includeTurns": False}, timeout=30)
             thread = thread_result.get("thread") if isinstance(thread_result, dict) else None
@@ -4819,6 +4874,8 @@ class MultiBotBridge:
                 flags = status.get("activeFlags")
                 if isinstance(flags, list):
                     active_flags = flags
+                if thread.get("cwd"):
+                    codex_cwd = str(thread.get("cwd"))
         except Exception as exc:
             thread_status = f"error: {exc}"
         lines = [
@@ -4836,10 +4893,12 @@ class MultiBotBridge:
             f"Fast: {'on' if record.get('fast') else 'off'}",
             f"Plan mode: {'ON' if record.get('plan_mode') else 'off'}",
             f"Approval: {approval_label(record.get('approval'))}",
-            f"Work dir: {display_path(record.get('cwd') or 'default')}",
+            f"Codex cwd: {display_path(codex_cwd or 'default')}",
             f"Active turn: {record.get('active_turn_id') or 'none'}",
             f"CLI takeover: {'active' if self.record_takeover_active(record) else 'off'}",
         ]
+        if pending_cwd:
+            lines.append(f"Pending cwd: {display_path(pending_cwd)}")
         takeover = record.get("takeover") if isinstance(record.get("takeover"), dict) else {}
         if self.record_takeover_active(record):
             queued = takeover.get("queued_messages") if isinstance(takeover.get("queued_messages"), list) else []
