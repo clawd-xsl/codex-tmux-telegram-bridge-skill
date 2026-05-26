@@ -94,6 +94,7 @@ PRIVATE_SESSION_COMMANDS = [("commands", "open Codex command card")]
 COMMAND_CARD_ACTIONS = [
     ("account_status", "Account"),
     ("session_status", "Session"),
+    ("mcp_menu", "MCP"),
     ("interrupt", "Interrupt"),
     ("plan", "Plan Mode"),
     ("goal_menu", "Goal"),
@@ -2476,6 +2477,11 @@ class MultiBotBridge:
             bot.answer_callback_query(cb_id)
             bot.edit_message_text(chat_id, int(message_id), self.render_session_status(record), reply_markup=self.session_back_keyboard(bot_key))
             return
+        if action in {"mcp_menu", "mcp_status", "mcp_reload"}:
+            bot.answer_callback_query(cb_id)
+            text = self.handle_mcp_action(action, record)
+            bot.edit_message_text(chat_id, int(message_id), text, reply_markup=self.mcp_menu_keyboard(bot_key))
+            return
         if action == "goal_menu":
             bot.answer_callback_query(cb_id)
             bot.edit_message_text(
@@ -2728,6 +2734,17 @@ class MultiBotBridge:
 
     def session_back_keyboard(self, bot_key: str) -> dict[str, Any]:
         return {"inline_keyboard": [[{"text": "Back", "callback_data": f"cmd:{bot_key}:back"}]]}
+
+    def mcp_menu_keyboard(self, bot_key: str) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "Reload MCP", "callback_data": f"cmd:{bot_key}:mcp_reload"},
+                    {"text": "Refresh Status", "callback_data": f"cmd:{bot_key}:mcp_status"},
+                ],
+                [{"text": "Back", "callback_data": f"cmd:{bot_key}:back"}],
+            ]
+        }
 
     def pending_session_input_keyboard(self, bot_key: str, pending_key: str, label: str) -> dict[str, Any]:
         return {"inline_keyboard": [[{"text": label, "callback_data": f"cmd:{bot_key}:cancel_pending:{pending_key}"}]]}
@@ -3496,6 +3513,47 @@ class MultiBotBridge:
     def read_thread_goal(self, thread_id: str) -> Any:
         result = self.app.request("thread/goal/get", {"threadId": thread_id}, timeout=30)
         return result.get("goal") if isinstance(result, dict) else result
+
+    def handle_mcp_action(self, action: str, record: dict[str, Any]) -> str:
+        reloaded = False
+        lines: list[str] = []
+        if action == "mcp_reload":
+            try:
+                self.ensure_thread_loaded(record)
+                self.app.request("config/mcpServer/reload", timeout=120)
+                reloaded = True
+            except Exception as exc:
+                return "\n".join(["MCP", "", f"Reload failed: {exc}"])
+        try:
+            status = self.app.request("mcpServerStatus/list", {"detail": "toolsAndAuthOnly"}, timeout=90)
+            servers = status.get("data") if isinstance(status, dict) else []
+        except Exception as exc:
+            return "\n".join(["MCP", "", "Reloaded." if reloaded else "Status unavailable.", f"Status failed: {exc}"])
+        lines += [
+            "MCP",
+            "",
+            "Reloaded. New MCP servers are available on the next Codex turn." if reloaded else "Configured MCP servers.",
+        ]
+        if record.get("active_turn_id"):
+            lines += ["", "A turn is currently running; reload will not change the tool set already sent to that running turn."]
+        if not isinstance(servers, list) or not servers:
+            lines += ["", "No MCP servers are currently available."]
+            return "\n".join(lines)
+        lines.append("")
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            name = str(server.get("name") or "unknown")
+            tools = server.get("tools") if isinstance(server.get("tools"), dict) else {}
+            tool_names = sorted(str(key) for key in tools.keys())
+            auth = server.get("authStatus") or "unknown"
+            lines.append(f"- {name}: {len(tool_names)} tools, auth {auth}")
+            if tool_names:
+                sample = ", ".join(tool_names[:5])
+                if len(tool_names) > 5:
+                    sample += f", +{len(tool_names) - 5} more"
+                lines.append(f"  {sample}")
+        return truncate_middle("\n".join(lines), 3900)
 
     def send_goal_replace_confirmation(
         self,
