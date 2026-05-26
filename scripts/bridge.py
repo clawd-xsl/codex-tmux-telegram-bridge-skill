@@ -232,6 +232,10 @@ def text_input(text: str) -> list[dict[str, Any]]:
     return [{"type": "text", "text": text, "text_elements": []}]
 
 
+def local_image_input(path: str) -> dict[str, Any]:
+    return {"type": "localImage", "path": path}
+
+
 def chunk_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
     if not text:
         return [""]
@@ -467,6 +471,12 @@ def normalize_cwd_path(value: str) -> str:
     return os.path.abspath(os.path.expanduser(value.strip()))
 
 
+def safe_filename(value: str, fallback: str) -> str:
+    name = os.path.basename(value.strip()) if value else ""
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return name[:160] or fallback
+
+
 class JsonStore:
     def __init__(self, home: str) -> None:
         self.home = os.path.abspath(os.path.expanduser(home))
@@ -589,6 +599,28 @@ class TelegramBot:
         payload = self.call("getChatMember", chat_id=chat_id, user_id=user_id)
         result = payload.get("result") if payload else None
         return result if isinstance(result, dict) else None
+
+    def get_file(self, file_id: str) -> dict[str, Any] | None:
+        payload = self.call("getFile", file_id=file_id)
+        result = payload.get("result") if payload else None
+        return result if isinstance(result, dict) else None
+
+    def download_file(self, file_path: str, destination: str) -> bool:
+        url_path = urllib.parse.quote(file_path, safe="/")
+        url = f"https://api.telegram.org/file/bot{self.token}/{url_path}"
+        try:
+            os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
+            with urllib.request.urlopen(url, timeout=self.timeout + 30) as response:
+                with open(destination, "wb") as handle:
+                    shutil.copyfileobj(response, handle)
+            os.chmod(destination, 0o600)
+            return True
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="replace")[:500]
+            log(f"telegram file download HTTP {exc.code}: {body}")
+        except Exception as exc:
+            log(f"telegram file download error: {exc}")
+        return False
 
     def create_forum_topic(self, chat_id: str | int, name: str) -> dict[str, Any] | None:
         payload = self.call("createForumTopic", chat_id=chat_id, name=name[:128])
@@ -2310,29 +2342,53 @@ class MultiBotBridge:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         user = message.get("from") if isinstance(message.get("from"), dict) else {}
         if not self.allowed(user, chat):
+            log(f"session bot {bot_key} ignored unauthorized message {self.message_log_context(message)}")
             return
         if self.bot_key_archived(bot_key):
+            log(f"session bot {bot_key} ignored archived message {self.message_log_context(message)}")
             return
         if self.message_added_this_bot(bot_key, message):
+            log(f"session bot {bot_key} added to chat {self.message_log_context(message)}")
             self.send_group_intro(bot_key, bot, chat, message.get("message_thread_id"))
             return
-        text = message.get("text")
-        if not isinstance(text, str) or not text.strip():
+        text = self.message_text(message)
+        attachment_specs = self.telegram_attachment_specs(message)
+        log(
+            f"session bot {bot_key} received message {self.message_log_context(message)} "
+            f"text_len={len(text.strip())} attachments={self.attachment_specs_label(attachment_specs)}"
+        )
+        if not text.strip() and not attachment_specs:
+            log(f"session bot {bot_key} ignored unsupported message {self.message_log_context(message)} keys={self.message_keys_label(message)}")
             return
         record = self.store.snapshot()["bots"].get(bot_key)
         if not isinstance(record, dict):
+            log(f"session bot {bot_key} missing record for message {self.message_log_context(message)}")
             return
-        if self.handle_pending_session_input(bot_key, bot, message, text, record):
+        if text and self.handle_pending_session_input(bot_key, bot, message, text, record):
+            log(f"session bot {bot_key} consumed pending input {self.message_log_context(message)}")
             return
         chat_type = chat.get("type")
         routed_text = self.route_text_for_session(text, bot_username, chat_type, message, record, bot_key)
         if routed_text is None:
+            log(
+                f"session bot {bot_key} ignored unrouted message {self.message_log_context(message)} "
+                f"topic_owner={self.topic_owner_for_message(message) or 'none'}"
+            )
             return
         command, args = parse_command(routed_text, bot_username)
-        if command:
+        if command and not attachment_specs:
+            log(f"session bot {bot_key} handling command /{command} {self.message_log_context(message)}")
             self.handle_session_command(bot_key, bot, message, command, args)
             return
-        self.start_or_steer_turn(bot_key, bot, message, routed_text)
+        attachments = self.download_telegram_attachments(bot_key, bot, message, attachment_specs)
+        if attachment_specs and not attachments:
+            log(f"session bot {bot_key} attachment download failed {self.message_log_context(message)} specs={self.attachment_specs_label(attachment_specs)}")
+            bot.send_message(msg_chat_id(message), "Could not download the Telegram attachment.", message_thread_id=message.get("message_thread_id"))
+            return
+        if attachments:
+            log(f"session bot {bot_key} downloaded attachments {self.message_log_context(message)} files={self.attachments_label(attachments)}")
+        log(f"session bot {bot_key} routing message to Codex {self.message_log_context(message)} input_items={1 + len([a for a in attachments if a.get('is_image')])}")
+        self.start_or_steer_turn(bot_key, bot, message, routed_text, input_items=self.build_user_input(routed_text, attachments))
 
     def handle_session_callback(self, bot_key: str, bot: TelegramBot, callback: dict[str, Any]) -> None:
         data = callback.get("data")
@@ -3161,6 +3217,164 @@ class MultiBotBridge:
             return text
         return None
 
+    @staticmethod
+    def message_text(message: dict[str, Any]) -> str:
+        text = message.get("text")
+        if isinstance(text, str):
+            return text
+        caption = message.get("caption")
+        if isinstance(caption, str):
+            return caption
+        return ""
+
+    @staticmethod
+    def message_log_context(message: dict[str, Any]) -> str:
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        user = message.get("from") if isinstance(message.get("from"), dict) else {}
+        return (
+            f"chat={chat.get('id', '')} type={chat.get('type', '')} "
+            f"topic={message.get('message_thread_id', 'none')} msg={message.get('message_id', '')} "
+            f"user={user.get('id', '')}"
+        )
+
+    @staticmethod
+    def message_keys_label(message: dict[str, Any]) -> str:
+        ignored = {"chat", "from", "date", "message_id", "message_thread_id"}
+        keys = [key for key in message.keys() if key not in ignored]
+        return ",".join(sorted(keys)) or "none"
+
+    @staticmethod
+    def attachment_specs_label(specs: list[dict[str, Any]]) -> str:
+        if not specs:
+            return "none"
+        labels = []
+        for spec in specs:
+            size = spec.get("file_size")
+            size_text = f":{size}" if size not in (None, "") else ""
+            labels.append(f"{spec.get('kind') or 'file'}:{spec.get('mime_type') or 'unknown'}{size_text}")
+        return ",".join(labels)
+
+    @staticmethod
+    def attachments_label(attachments: list[dict[str, Any]]) -> str:
+        if not attachments:
+            return "none"
+        labels = []
+        for attachment in attachments:
+            image = ":image" if attachment.get("is_image") else ""
+            labels.append(f"{attachment.get('file_name') or 'file'}{image}")
+        return ",".join(labels)
+
+    @staticmethod
+    def telegram_attachment_specs(message: dict[str, Any]) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
+        document = message.get("document")
+        if isinstance(document, dict) and document.get("file_id"):
+            specs.append(
+                {
+                    "kind": "document",
+                    "file_id": document.get("file_id"),
+                    "file_name": document.get("file_name") or "document",
+                    "mime_type": document.get("mime_type"),
+                    "file_size": document.get("file_size"),
+                }
+            )
+        photos = message.get("photo")
+        if isinstance(photos, list) and photos:
+            photo = max(
+                (item for item in photos if isinstance(item, dict) and item.get("file_id")),
+                key=lambda item: int(item.get("file_size") or item.get("width") or 0),
+                default=None,
+            )
+            if isinstance(photo, dict):
+                specs.append(
+                    {
+                        "kind": "photo",
+                        "file_id": photo.get("file_id"),
+                        "file_name": f"photo_{photo.get('file_unique_id') or photo.get('file_id')}.jpg",
+                        "mime_type": "image/jpeg",
+                        "file_size": photo.get("file_size"),
+                    }
+                )
+        for kind in ("animation", "audio", "video", "voice", "video_note"):
+            value = message.get(kind)
+            if not isinstance(value, dict) or not value.get("file_id"):
+                continue
+            specs.append(
+                {
+                    "kind": kind,
+                    "file_id": value.get("file_id"),
+                    "file_name": value.get("file_name") or kind,
+                    "mime_type": value.get("mime_type"),
+                    "file_size": value.get("file_size"),
+                }
+            )
+        return specs
+
+    def download_telegram_attachments(
+        self,
+        bot_key: str,
+        bot: TelegramBot,
+        message: dict[str, Any],
+        specs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not specs:
+            return []
+        message_id = str(message.get("message_id") or now_ms())
+        directory = os.path.join(self.store.home, "attachments", bot_key, message_id)
+        attachments: list[dict[str, Any]] = []
+        for index, spec in enumerate(specs, 1):
+            file_id = str(spec.get("file_id") or "")
+            if not file_id:
+                continue
+            file_info = bot.get_file(file_id)
+            file_path = str((file_info or {}).get("file_path") or "")
+            if not file_path:
+                log(f"telegram getFile returned no file_path for {spec.get('kind') or 'file'}")
+                continue
+            source_name = str(spec.get("file_name") or os.path.basename(file_path) or f"attachment-{index}")
+            fallback = f"attachment-{index}{os.path.splitext(file_path)[1] or ''}"
+            filename = safe_filename(source_name, fallback)
+            if "." not in filename and os.path.splitext(file_path)[1]:
+                filename += os.path.splitext(file_path)[1]
+            destination = os.path.join(directory, filename)
+            if not bot.download_file(file_path, destination):
+                log(f"telegram attachment download failed file_path={file_path} destination={destination}")
+                continue
+            mime_type = str(spec.get("mime_type") or "")
+            is_image = mime_type.startswith("image/") or str(spec.get("kind")) == "photo"
+            attachments.append(
+                {
+                    "kind": spec.get("kind"),
+                    "path": destination,
+                    "file_name": filename,
+                    "mime_type": mime_type or "unknown",
+                    "file_size": spec.get("file_size"),
+                    "is_image": is_image,
+                }
+            )
+        return attachments
+
+    @staticmethod
+    def build_user_input(text: str, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        lines: list[str] = []
+        if text.strip():
+            lines.append(text.strip())
+        if attachments:
+            lines.append("Telegram attachment(s) saved locally:")
+            for attachment in attachments:
+                size = attachment.get("file_size")
+                size_text = f", {size} bytes" if size not in (None, "") else ""
+                lines.append(
+                    f"- {attachment.get('file_name')} ({attachment.get('mime_type')}{size_text})\n  path: {attachment.get('path')}"
+                )
+            if not text.strip():
+                lines.append("Please inspect the attached file(s).")
+        inputs = text_input("\n\n".join(lines).strip() or "Please inspect the attached file(s).")
+        for attachment in attachments:
+            if attachment.get("is_image") and attachment.get("path"):
+                inputs.append(local_image_input(str(attachment["path"])))
+        return inputs
+
     def topic_owner_for_message(self, message: dict[str, Any]) -> str | None:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         chat_id = str(chat.get("id", ""))
@@ -3684,7 +3898,15 @@ class MultiBotBridge:
             },
         }
 
-    def start_or_steer_turn(self, bot_key: str, bot: TelegramBot, message: dict[str, Any], text: str) -> None:
+    def start_or_steer_turn(
+        self,
+        bot_key: str,
+        bot: TelegramBot,
+        message: dict[str, Any],
+        text: str,
+        *,
+        input_items: list[dict[str, Any]] | None = None,
+    ) -> None:
         record = self.store.snapshot()["bots"].get(bot_key)
         if not isinstance(record, dict):
             return
@@ -3716,7 +3938,7 @@ class MultiBotBridge:
             output_message_id = output.pending_message_id
         params = {
             "threadId": thread_id,
-            "input": text_input(text),
+            "input": input_items if input_items is not None else text_input(text),
         }
         try:
             self.ensure_thread_loaded(record)
@@ -3726,6 +3948,7 @@ class MultiBotBridge:
             active_turn_id = record.get("active_turn_id")
             if active_turn_id:
                 params["expectedTurnId"] = active_turn_id
+                log(f"session bot {bot_key} steering Codex turn thread={thread_id} turn={active_turn_id} input_items={len(params['input'])}")
                 result = self.app.request("turn/steer", params, timeout=60)
                 turn = result.get("turn") if isinstance(result, dict) else None
                 turn_id = active_turn_id
@@ -3744,10 +3967,12 @@ class MultiBotBridge:
                     params["effort"] = effort
                 if cwd:
                     params["cwd"] = cwd
+                log(f"session bot {bot_key} starting Codex turn thread={thread_id} input_items={len(params['input'])} cwd={cwd or 'default'}")
                 result = self.app.request("turn/start", params, timeout=60)
                 turn = result.get("turn") if isinstance(result, dict) else None
                 turn_id = turn.get("id") if isinstance(turn, dict) else None
         except Exception as exc:
+            log(f"session bot {bot_key} Codex request failed thread={thread_id}: {exc}")
             if created_placeholder:
                 with self.runtime_lock:
                     self.output_by_thread.pop(thread_id, None)
@@ -3763,6 +3988,7 @@ class MultiBotBridge:
             else:
                 bot.send_message(chat_id, "Codex did not return a turn id.", message_thread_id=message_thread_id)
             return
+        log(f"session bot {bot_key} Codex turn accepted thread={thread_id} turn={turn_id}")
         self.store.update(lambda data: data["bots"][bot_key].update({"active_turn_id": turn_id}))
         with self.runtime_lock:
             output = self.output_by_thread.get(thread_id)
