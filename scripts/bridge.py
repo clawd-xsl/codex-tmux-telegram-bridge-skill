@@ -74,6 +74,10 @@ TELEGRAM_PLACEHOLDER_MAX_STEPS = 6
 ACTIVITY_EDIT_INTERVAL = 4.0
 ACTIVITY_DETAIL_PAGE_LIMIT = 3500
 ACTIVITY_DETAIL_MAX_ITEMS = 40
+TAKEOVER_DETAIL_PAGE_LIMIT = 3500
+TAKEOVER_DETAIL_MAX_ITEMS = 80
+TAKEOVER_MAX_QUEUED_MESSAGES = 100
+TAKEOVER_MAX_STORED_TRANSCRIPTS = 40
 
 
 SESSION_COMMANDS = [
@@ -104,6 +108,7 @@ COMMAND_CARD_ACTIONS = [
     ("effort_menu", "Effort"),
     ("cwd_browser", "Work Dir"),
     ("fast_toggle", "Fast"),
+    ("takeover_menu", "CLI Takeover"),
 ]
 
 
@@ -489,6 +494,7 @@ class JsonStore:
             "pending_session_inputs": {},
             "pending_goal_replacements": {},
             "path_browsers": {},
+            "takeover_transcripts": {},
             "pending_creations": {},
             "manager": {},
         }
@@ -666,6 +672,7 @@ class TelegramBot:
         message_id: int,
         text: str,
         *,
+        parse_mode: str | None = None,
         reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         return self.call(
@@ -673,6 +680,7 @@ class TelegramBot:
             chat_id=chat_id,
             message_id=message_id,
             text=text[:TELEGRAM_EDIT_LIMIT] or " ",
+            parse_mode=parse_mode,
             disable_web_page_preview=True,
             reply_markup=reply_markup,
         )
@@ -911,14 +919,29 @@ class MultiBotBridge:
     def record_archived(record: dict[str, Any] | None) -> bool:
         return isinstance(record, dict) and record.get("status") == "archived"
 
+    @staticmethod
+    def record_takeover_active(record: dict[str, Any] | None) -> bool:
+        takeover = record.get("takeover") if isinstance(record, dict) else None
+        return isinstance(takeover, dict) and takeover.get("status") == "active"
+
     def bot_key_archived(self, bot_key: str) -> bool:
         record = self.store.snapshot().get("bots", {}).get(bot_key)
         return self.record_archived(record if isinstance(record, dict) else None)
+
+    def bot_key_takeover_active(self, bot_key: str) -> bool:
+        record = self.store.snapshot().get("bots", {}).get(bot_key)
+        return self.record_takeover_active(record if isinstance(record, dict) else None)
 
     def thread_archived(self, thread_id: str) -> bool:
         for record in self.store.snapshot().get("bots", {}).values():
             if isinstance(record, dict) and str(record.get("thread_id") or "") == thread_id:
                 return self.record_archived(record)
+        return False
+
+    def thread_takeover_active(self, thread_id: str) -> bool:
+        for record in self.store.snapshot().get("bots", {}).values():
+            if isinstance(record, dict) and str(record.get("thread_id") or "") == thread_id:
+                return self.record_takeover_active(record)
         return False
 
     def run(self) -> None:
@@ -1142,6 +1165,8 @@ class MultiBotBridge:
             if not isinstance(record, dict):
                 continue
             if self.record_archived(record):
+                continue
+            if self.record_takeover_active(record):
                 continue
             self.ensure_thread_loaded(record)
             chat_id = record.get("group_chat_id")
@@ -1937,6 +1962,8 @@ class MultiBotBridge:
         name = normalize_display_name(str(record.get("name") or record.get("username") or "Codex"))
         username = str(record.get("username") or "")
         state = "archived" if self.record_archived(record) else "active"
+        if self.record_takeover_active(record):
+            state = "CLI takeover"
         if username:
             return f"{name} (@{username}) [{state}]"
         return f"{name} [{state}]"
@@ -2088,6 +2115,8 @@ class MultiBotBridge:
         thread_map = record.get("group_message_threads")
         topic_count = len(thread_map) if isinstance(thread_map, dict) else 0
         state = "archived" if self.record_archived(record) else "active"
+        if self.record_takeover_active(record):
+            state = "CLI takeover"
         lines = [
             "Session",
             "",
@@ -2099,6 +2128,10 @@ class MultiBotBridge:
             f"Work dir: {display_path(record.get('cwd') or 'default')}",
             f"Topics: {topic_count}",
         ]
+        takeover = record.get("takeover") if isinstance(record.get("takeover"), dict) else {}
+        if self.record_takeover_active(record):
+            queued = takeover.get("queued_messages") if isinstance(takeover.get("queued_messages"), list) else []
+            lines.append(f"Queued Telegram messages: {len(queued)}")
         if record.get("archived_at_ms"):
             lines.append(f"Archived at: {format_epoch_ms(record.get('archived_at_ms'))}")
         return "\n".join(lines)
@@ -2387,8 +2420,32 @@ class MultiBotBridge:
             return
         if attachments:
             log(f"session bot {bot_key} downloaded attachments {self.message_log_context(message)} files={self.attachments_label(attachments)}")
+        input_items = self.build_user_input(routed_text, attachments)
+        record = self.store.snapshot()["bots"].get(bot_key)
+        if isinstance(record, dict) and self.record_takeover_active(record):
+            ok, queue_size = self.queue_takeover_message(bot_key, message, routed_text, input_items)
+            if ok:
+                log(f"session bot {bot_key} queued takeover message {self.message_log_context(message)} queue_size={queue_size}")
+                bot.send_message(
+                    msg_chat_id(message),
+                    f"Queued for CLI takeover. {queue_size} Telegram message(s) waiting.",
+                    message_thread_id=message.get("message_thread_id"),
+                    reply_markup={
+                        "inline_keyboard": [[{"text": "Resume Telegram", "callback_data": f"cmd:{bot_key}:takeover_resume"}]]
+                    },
+                )
+            else:
+                bot.send_message(
+                    msg_chat_id(message),
+                    "CLI takeover queue is full. Tap Resume Telegram before sending more messages.",
+                    message_thread_id=message.get("message_thread_id"),
+                    reply_markup={
+                        "inline_keyboard": [[{"text": "Resume Telegram", "callback_data": f"cmd:{bot_key}:takeover_resume"}]]
+                    },
+                )
+            return
         log(f"session bot {bot_key} routing message to Codex {self.message_log_context(message)} input_items={1 + len([a for a in attachments if a.get('is_image')])}")
-        self.start_or_steer_turn(bot_key, bot, message, routed_text, input_items=self.build_user_input(routed_text, attachments))
+        self.start_or_steer_turn(bot_key, bot, message, routed_text, input_items=input_items)
 
     def handle_session_callback(self, bot_key: str, bot: TelegramBot, callback: dict[str, Any]) -> None:
         data = callback.get("data")
@@ -2402,6 +2459,9 @@ class MultiBotBridge:
             return
         if data.startswith("cmd:"):
             self.handle_session_command_callback(bot_key, bot, callback)
+            return
+        if data.startswith("t:"):
+            self.handle_takeover_transcript_callback(bot_key, bot, callback)
             return
         if not data.startswith("a:"):
             return
@@ -2483,6 +2543,22 @@ class MultiBotBridge:
         if not chat_id or not message_id:
             bot.answer_callback_query(cb_id, "Missing message context", show_alert=True)
             return
+        if self.record_takeover_active(record) and action not in {
+            "commands",
+            "back",
+            "account_status",
+            "status",
+            "session_status",
+            "bridge_status",
+            "takeover_menu",
+            "takeover_resume",
+        }:
+            bot.answer_callback_query(
+                cb_id,
+                "CLI takeover is active. Tap Resume Telegram before changing this session.",
+                show_alert=True,
+            )
+            return
 
         if action in {"goal_replace", "goal_cancel"}:
             pending = self.store.snapshot().get("pending_goal_replacements", {}).get(value)
@@ -2537,6 +2613,49 @@ class MultiBotBridge:
             bot.answer_callback_query(cb_id)
             text = self.handle_mcp_action(action, record)
             bot.edit_message_text(chat_id, int(message_id), text, reply_markup=self.mcp_menu_keyboard(bot_key))
+            return
+        if action == "takeover_menu":
+            bot.answer_callback_query(cb_id)
+            bot.edit_message_text(
+                chat_id,
+                int(message_id),
+                self.render_takeover_menu(record),
+                parse_mode="HTML",
+                reply_markup=self.takeover_menu_keyboard(bot_key, record),
+            )
+            return
+        if action == "takeover_start":
+            if self.task_running(record):
+                bot.answer_callback_query(cb_id, "Finish or interrupt the active turn before CLI takeover.", show_alert=True)
+                return
+            ok, text = self.start_terminal_takeover(bot_key, str(user.get("id") or ""), chat_id, message_thread_id, record)
+            bot.answer_callback_query(cb_id, "Takeover started" if ok else "Takeover failed", show_alert=not ok)
+            updated = self.store.snapshot()["bots"].get(bot_key, record)
+            if ok and isinstance(updated, dict):
+                bot.edit_message_text(
+                    chat_id,
+                    int(message_id),
+                    self.render_takeover_menu(updated),
+                    parse_mode="HTML",
+                    reply_markup=self.takeover_menu_keyboard(bot_key, updated),
+                )
+            else:
+                bot.edit_message_text(chat_id, int(message_id), text, reply_markup=self.session_back_keyboard(bot_key))
+            return
+        if action == "takeover_resume":
+            ok, text = self.resume_terminal_takeover(bot_key, bot, chat_id, message_thread_id, record)
+            bot.answer_callback_query(cb_id, "Telegram resumed" if ok else "Resume failed", show_alert=not ok)
+            updated = self.store.snapshot()["bots"].get(bot_key, record)
+            if ok and isinstance(updated, dict):
+                bot.edit_message_text(
+                    chat_id,
+                    int(message_id),
+                    self.render_takeover_menu(updated),
+                    parse_mode="HTML",
+                    reply_markup=self.takeover_menu_keyboard(bot_key, updated),
+                )
+            else:
+                bot.edit_message_text(chat_id, int(message_id), text, reply_markup=self.takeover_menu_keyboard(bot_key, record))
             return
         if action == "goal_menu":
             bot.answer_callback_query(cb_id)
@@ -2729,6 +2848,7 @@ class MultiBotBridge:
     def render_session_command_card(self, record: dict[str, Any]) -> str:
         slug = record.get("command_slug") or command_slug_from_name(str(record.get("name") or record.get("username") or "codex"))
         plan_label = "ON - next idle turn uses Plan mode" if record.get("plan_mode") else "off - normal chat mode"
+        takeover_label = "active - finish in CLI, then Resume Telegram" if self.record_takeover_active(record) else "off"
         return "\n".join(
             [
                 "Codex Commands",
@@ -2740,6 +2860,7 @@ class MultiBotBridge:
                 f"Fast: {'on' if record.get('fast') else 'off'}",
                 f"Plan mode: {plan_label}",
                 f"Current work dir: {display_path(record.get('cwd') or 'default')}",
+                f"CLI takeover: {takeover_label}",
             ]
         )
 
@@ -2747,6 +2868,17 @@ class MultiBotBridge:
         if record is None:
             snapshot_record = self.store.snapshot().get("bots", {}).get(bot_key)
             record = snapshot_record if isinstance(snapshot_record, dict) else {}
+        if self.record_takeover_active(record):
+            return {
+                "inline_keyboard": [
+                    [{"text": "Resume Telegram", "callback_data": f"cmd:{bot_key}:takeover_resume"}],
+                    [
+                        {"text": "Session", "callback_data": f"cmd:{bot_key}:session_status"},
+                        {"text": "Account", "callback_data": f"cmd:{bot_key}:account_status"},
+                    ],
+                    [{"text": "CLI Takeover", "callback_data": f"cmd:{bot_key}:takeover_menu"}],
+                ]
+            }
         rows: list[list[dict[str, Any]]] = []
         current: list[dict[str, Any]] = []
         for action, label in COMMAND_CARD_ACTIONS:
@@ -2754,6 +2886,8 @@ class MultiBotBridge:
                 label = "Plan: ON" if record.get("plan_mode") else "Plan: Off"
             elif action == "fast_toggle":
                 label = "Fast: On" if record.get("fast") else "Fast: Off"
+            elif action == "takeover_menu":
+                label = "Resume" if self.record_takeover_active(record) else "CLI Takeover"
             current.append({"text": label, "callback_data": f"cmd:{bot_key}:{action}"})
             if len(current) == 2:
                 rows.append(current)
@@ -2801,6 +2935,59 @@ class MultiBotBridge:
                 [{"text": "Back", "callback_data": f"cmd:{bot_key}:back"}],
             ]
         }
+
+    def render_takeover_menu(self, record: dict[str, Any]) -> str:
+        takeover = record.get("takeover") if isinstance(record.get("takeover"), dict) else {}
+        command = self.terminal_resume_command(record)
+        command_block = f"<pre>{html.escape(command)}</pre>"
+        if self.record_takeover_active(record):
+            queued = takeover.get("queued_messages") if isinstance(takeover.get("queued_messages"), list) else []
+            return "\n".join(
+                [
+                    "CLI Takeover",
+                    "",
+                    f"Bot: @{record.get('username')}",
+                    "State: CLI owns this Codex session",
+                    f"Started: {format_epoch_ms(takeover.get('started_at_ms'))}",
+                    f"Queued Telegram messages: {len(queued)}",
+                    "",
+                    "Run this in your CLI:",
+                    command_block,
+                    "",
+                    "After you finish in the CLI, tap Resume Telegram. I will post a compact transcript with a Details button, then send queued Telegram messages into Codex.",
+                ]
+            )
+        return "\n".join(
+            [
+                "CLI Takeover",
+                "",
+                f"Bot: @{record.get('username')}",
+                "State: Telegram owns this Codex session",
+                "",
+                "Start takeover when you want to continue this exact Codex session in a local CLI.",
+                "",
+                "Command:",
+                command_block,
+            ]
+        )
+
+    def takeover_menu_keyboard(self, bot_key: str, record: dict[str, Any]) -> dict[str, Any]:
+        if self.record_takeover_active(record):
+            rows = [
+                [{"text": "Resume Telegram", "callback_data": f"cmd:{bot_key}:takeover_resume"}],
+                [{"text": "Back", "callback_data": f"cmd:{bot_key}:back"}],
+            ]
+        else:
+            rows = [
+                [{"text": "Start Takeover", "callback_data": f"cmd:{bot_key}:takeover_start"}],
+                [{"text": "Back", "callback_data": f"cmd:{bot_key}:back"}],
+            ]
+        return {"inline_keyboard": rows}
+
+    @staticmethod
+    def terminal_resume_command(record: dict[str, Any]) -> str:
+        session_id = str(record.get("session_id") or record.get("thread_id") or "").strip()
+        return f"codex resume {session_id}" if session_id else "codex resume <session-id>"
 
     def pending_session_input_keyboard(self, bot_key: str, pending_key: str, label: str) -> dict[str, Any]:
         return {"inline_keyboard": [[{"text": label, "callback_data": f"cmd:{bot_key}:cancel_pending:{pending_key}"}]]}
@@ -3581,6 +3768,25 @@ class MultiBotBridge:
         chat_id, thread_id = msg_chat_id(message), record["thread_id"]
         message_thread_id = message.get("message_thread_id")
         slug = str(record.get("command_slug") or command_slug_from_name(str(record.get("name") or record.get("username") or "codex")))
+        if self.record_takeover_active(record) and command not in {
+            "commands",
+            slug,
+            "status",
+            "start",
+            "account",
+            "account_status",
+            "session",
+            "session_status",
+            "bridge",
+            "bridge_status",
+        }:
+            bot.send_message(
+                chat_id,
+                "CLI takeover is active. Open the command card and tap Resume Telegram before changing this session.",
+                message_thread_id=message_thread_id,
+                reply_markup={"inline_keyboard": [[{"text": "Resume Telegram", "callback_data": f"cmd:{bot_key}:takeover_resume"}]]},
+            )
+            return
         if command in {"commands", slug}:
             self.send_session_command_card(bot_key, bot, chat_id, message_thread_id, record)
         elif command in {"status", "start", "account", "account_status"}:
@@ -3768,6 +3974,554 @@ class MultiBotBridge:
                     sample += f", +{len(tool_names) - 5} more"
                 lines.append(f"  {sample}")
         return truncate_middle("\n".join(lines), 3900)
+
+    def start_terminal_takeover(
+        self,
+        bot_key: str,
+        user_id: str,
+        chat_id: str,
+        message_thread_id: int | None,
+        record: dict[str, Any],
+    ) -> tuple[bool, str]:
+        if self.record_takeover_active(record):
+            return True, self.render_takeover_menu(record)
+        thread_id = str(record.get("thread_id") or "")
+        if not thread_id:
+            return False, "CLI takeover failed: this session has no Codex thread id."
+        try:
+            thread = self.read_thread_history(record, reload=False)
+        except Exception as exc:
+            return False, f"CLI takeover failed: could not read Codex thread: {exc}"
+        if self.thread_runtime_active(thread):
+            return False, "CLI takeover is only available while Codex is idle. Finish or interrupt the active turn first."
+        entries = self.flatten_thread_entries(thread)
+        cursor_key = entries[-1]["key"] if entries else None
+        cursor_turn_id = entries[-1]["turn_id"] if entries else None
+        try:
+            self.app.request("thread/unsubscribe", {"threadId": thread_id}, timeout=30)
+        except Exception as exc:
+            log(f"thread/unsubscribe before CLI takeover failed for {thread_id}: {exc}")
+        with self.runtime_lock:
+            self.loaded_threads.discard(thread_id)
+            self.output_by_thread.pop(thread_id, None)
+        started_at_ms = now_ms()
+
+        def mutate(data: dict[str, Any]) -> None:
+            target = data["bots"].get(bot_key)
+            if not isinstance(target, dict):
+                return
+            target["takeover"] = {
+                "status": "active",
+                "started_at_ms": started_at_ms,
+                "started_by_user_id": user_id,
+                "chat_id": chat_id,
+                "message_thread_id": message_thread_id,
+                "cursor_key": cursor_key,
+                "cursor_turn_id": cursor_turn_id,
+                "queued_messages": [],
+            }
+            target["active_turn_id"] = None
+
+        self.store.update(mutate)
+        updated = self.store.snapshot().get("bots", {}).get(bot_key, record)
+        return True, self.render_takeover_menu(updated if isinstance(updated, dict) else record)
+
+    def resume_terminal_takeover(
+        self,
+        bot_key: str,
+        bot: TelegramBot,
+        chat_id: str,
+        message_thread_id: int | None,
+        record: dict[str, Any],
+    ) -> tuple[bool, str]:
+        takeover = record.get("takeover") if isinstance(record.get("takeover"), dict) else None
+        if not isinstance(takeover, dict) or takeover.get("status") != "active":
+            return True, "No active CLI takeover."
+        try:
+            thread = self.read_thread_history(record, reload=True)
+        except Exception as exc:
+            return False, f"Resume failed: could not reload Codex thread: {exc}"
+        if self.thread_runtime_active(thread):
+            return False, "The CLI Codex session still appears to be running. Exit or finish the CLI turn, then tap Resume Telegram again."
+        synced_cwd = self.sync_cwd_after_cli_takeover(bot_key, thread)
+        if synced_cwd:
+            record = {**record, "cwd": synced_cwd}
+        entries = self.thread_entries_after_cursor(
+            self.flatten_thread_entries(thread),
+            str(takeover.get("cursor_key") or ""),
+            takeover.get("started_at_ms"),
+        )
+        summary, pages = self.render_takeover_transcript(record, takeover, entries)
+        transcript_id = self.store_takeover_transcript(bot_key, chat_id, message_thread_id, summary, pages)
+        bot.send_message(
+            chat_id,
+            summary,
+            message_thread_id=message_thread_id,
+            reply_markup=self.takeover_transcript_keyboard(transcript_id, view="summary", page=0, page_count=len(pages)),
+        )
+        queued_messages = takeover.get("queued_messages") if isinstance(takeover.get("queued_messages"), list) else []
+        resumed_at_ms = now_ms()
+
+        def mutate(data: dict[str, Any]) -> None:
+            target = data["bots"].get(bot_key)
+            if not isinstance(target, dict):
+                return
+            target["takeover"] = {
+                "status": "inactive",
+                "last_started_at_ms": takeover.get("started_at_ms"),
+                "last_resumed_at_ms": resumed_at_ms,
+                "last_transcript_id": transcript_id,
+            }
+            target["active_turn_id"] = None
+
+        self.store.update(mutate)
+        self.replay_takeover_queued_messages(bot_key, bot, chat_id, message_thread_id, queued_messages)
+        return True, "Telegram resumed. I posted the CLI transcript and restored normal routing for this session."
+
+    def sync_cwd_after_cli_takeover(self, bot_key: str, thread: dict[str, Any]) -> str | None:
+        thread_id = str(thread.get("id") or "")
+        cwd = self.latest_rollout_cwd(thread_id) or str(thread.get("cwd") or "").strip()
+        if not cwd:
+            return None
+        normalized = normalize_cwd_path(cwd)
+        if self.validate_cwd_path(normalized):
+            log(f"skipping CLI takeover cwd sync for {thread_id}: invalid cwd {cwd}")
+            return None
+
+        def mutate(data: dict[str, Any]) -> None:
+            target = data["bots"].get(bot_key)
+            if not isinstance(target, dict):
+                return
+            if target.get("cwd") != normalized:
+                target["cwd"] = normalized
+                target["cwd_synced_from_cli_at_ms"] = now_ms()
+
+        self.store.update(mutate)
+        return normalized
+
+    @staticmethod
+    def latest_rollout_cwd(thread_id: str) -> str | None:
+        if not thread_id:
+            return None
+        sessions_root = os.path.expanduser("~/.codex/sessions")
+        if not os.path.isdir(sessions_root):
+            return None
+        suffix = f"{thread_id}.jsonl"
+        paths: list[str] = []
+        for root, _, filenames in os.walk(sessions_root):
+            for filename in filenames:
+                if filename.endswith(suffix):
+                    paths.append(os.path.join(root, filename))
+        if not paths:
+            return None
+        path = max(paths, key=lambda item: os.path.getmtime(item))
+        latest_cwd: str | None = None
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                    if event.get("type") not in {"session_meta", "turn_context"}:
+                        continue
+                    cwd = payload.get("cwd")
+                    if isinstance(cwd, str) and cwd.strip():
+                        latest_cwd = cwd.strip()
+        except OSError as exc:
+            log(f"could not read rollout cwd for {thread_id}: {exc}")
+        return latest_cwd
+
+    def read_thread_history(self, record: dict[str, Any], *, reload: bool) -> dict[str, Any]:
+        thread_id = str(record.get("thread_id") or "")
+        if not thread_id:
+            raise RuntimeError("missing thread id")
+        if reload:
+            with self.runtime_lock:
+                self.loaded_threads.discard(thread_id)
+            self.app.request("thread/resume", {"threadId": thread_id}, timeout=90)
+            with self.runtime_lock:
+                self.loaded_threads.add(thread_id)
+        else:
+            self.ensure_thread_loaded(record)
+        result = self.app.request("thread/read", {"threadId": thread_id, "includeTurns": True}, timeout=120)
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict):
+            raise RuntimeError(f"unexpected thread/read response: {result}")
+        return thread
+
+    @staticmethod
+    def thread_runtime_active(thread: dict[str, Any]) -> bool:
+        status = thread.get("status") if isinstance(thread.get("status"), dict) else {}
+        if status.get("type") == "active":
+            return True
+        turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
+        for turn in reversed(turns):
+            if not isinstance(turn, dict):
+                continue
+            return turn.get("status") == "inProgress"
+        return False
+
+    @staticmethod
+    def flatten_thread_entries(thread: dict[str, Any]) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
+        for turn_index, turn in enumerate(turns):
+            if not isinstance(turn, dict):
+                continue
+            turn_id = str(turn.get("id") or f"turn-{turn_index}")
+            items = turn.get("items") if isinstance(turn.get("items"), list) else []
+            for item_index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id") or item_index)
+                entries.append(
+                    {
+                        "key": f"{turn_id}:{item_id}:{item_index}",
+                        "turn_id": turn_id,
+                        "turn_status": turn.get("status"),
+                        "turn_started_at": turn.get("startedAt"),
+                        "turn_completed_at": turn.get("completedAt"),
+                        "item": item,
+                    }
+                )
+        return entries
+
+    @staticmethod
+    def thread_entries_after_cursor(
+        entries: list[dict[str, Any]],
+        cursor_key: str,
+        started_at_ms: Any,
+    ) -> list[dict[str, Any]]:
+        if not cursor_key:
+            return entries
+        found = False
+        after: list[dict[str, Any]] = []
+        for entry in entries:
+            if found:
+                after.append(entry)
+            elif entry.get("key") == cursor_key:
+                found = True
+        if found:
+            return after
+        try:
+            started_at = int(started_at_ms) / 1000 - 2
+        except (TypeError, ValueError):
+            return entries[-TAKEOVER_DETAIL_MAX_ITEMS:]
+        fallback = []
+        for entry in entries:
+            try:
+                turn_started = float(entry.get("turn_started_at"))
+            except (TypeError, ValueError):
+                continue
+            if turn_started >= started_at:
+                fallback.append(entry)
+        return fallback
+
+    def render_takeover_transcript(
+        self,
+        record: dict[str, Any],
+        takeover: dict[str, Any],
+        entries: list[dict[str, Any]],
+    ) -> tuple[str, list[str]]:
+        user_count = 0
+        assistant_count = 0
+        plan_count = 0
+        activity_count = 0
+        latest_assistant = ""
+        latest_user = ""
+        for entry in entries:
+            item = entry.get("item") if isinstance(entry.get("item"), dict) else {}
+            item_type = item.get("type")
+            if item_type == "userMessage":
+                user_count += 1
+                latest_user = self.render_user_message_item(item)
+            elif item_type == "agentMessage":
+                assistant_count += 1
+                latest_assistant = str(item.get("text") or "").strip()
+            elif item_type == "plan":
+                plan_count += 1
+            elif item_type not in {"reasoning", "hookPrompt"}:
+                activity_count += 1
+        parts = []
+        if user_count:
+            parts.append(f"{user_count} CLI user")
+        if assistant_count:
+            parts.append(f"{assistant_count} Codex")
+        if plan_count:
+            parts.append(f"{plan_count} plan")
+        if activity_count:
+            parts.append(f"{activity_count} activity")
+        captured = ", ".join(parts) if parts else "no new CLI messages"
+        lines = [
+            "CLI transcript",
+            "",
+            f"Bot: @{record.get('username')}",
+            f"Session: {record.get('session_id') or record.get('thread_id')}",
+            f"Takeover: {format_epoch_ms(takeover.get('started_at_ms'))} -> {format_epoch_ms(now_ms())}",
+            f"Captured: {captured}",
+        ]
+        if latest_assistant:
+            lines += ["", "Latest Codex message:", truncate_middle(latest_assistant, 1000)]
+        elif latest_user:
+            lines += ["", "Latest CLI user message:", truncate_middle(latest_user, 1000)]
+        elif not entries:
+            lines += ["", "No CLI turns were added after takeover started."]
+        pages = self.render_takeover_detail_pages(entries)
+        return truncate_middle("\n".join(lines), 3900), pages
+
+    def render_takeover_detail_pages(self, entries: list[dict[str, Any]]) -> list[str]:
+        if not entries:
+            return []
+        lines = ["CLI transcript details", ""]
+        rendered_count = 0
+        for entry in entries:
+            item = entry.get("item") if isinstance(entry.get("item"), dict) else {}
+            if item.get("type") in {"reasoning", "hookPrompt"}:
+                continue
+            rendered = self.render_takeover_item(entry)
+            if not rendered:
+                continue
+            rendered_count += 1
+            lines.append(f"{rendered_count}. {rendered}")
+            lines.append("")
+            if rendered_count >= TAKEOVER_DETAIL_MAX_ITEMS:
+                break
+        remaining = max(0, len(entries) - rendered_count)
+        if remaining:
+            lines.append(f"... {remaining} more item(s) omitted")
+        return chunk_text("\n".join(lines).strip(), TAKEOVER_DETAIL_PAGE_LIMIT)
+
+    def render_takeover_item(self, entry: dict[str, Any]) -> str:
+        item = entry.get("item") if isinstance(entry.get("item"), dict) else {}
+        item_type = item.get("type")
+        turn_id = str(entry.get("turn_id") or "")
+        turn_label = f"turn {turn_id[:8]}" if turn_id else "turn"
+        if item_type == "userMessage":
+            text = self.render_user_message_item(item)
+            return f"CLI user ({turn_label})\n{truncate_middle(text, 1800)}"
+        if item_type == "agentMessage":
+            text = str(item.get("text") or "").strip()
+            return f"Codex ({turn_label})\n{truncate_middle(text or '(empty message)', 2200)}"
+        if item_type == "plan":
+            text = str(item.get("text") or "").strip()
+            return f"Plan ({turn_label})\n{truncate_middle(text or '(empty plan)', 1800)}"
+        status = self.build_status_item(item, completed=True, output_text="")
+        if status:
+            marker = "failed" if status.failed else status.status
+            detail = status.detail or status.label
+            return f"Activity ({turn_label})\n{status.item_type}: {self.compact_label(status.label, 200)} [{marker}]\n{truncate_middle(detail, 1600)}"
+        if item_type == "contextCompaction":
+            return f"Activity ({turn_label})\ncontext compaction"
+        if item_type == "imageView":
+            return f"Activity ({turn_label})\nimage view: {item.get('path')}"
+        if item_type == "imageGeneration":
+            return f"Activity ({turn_label})\nimage generation: {item.get('status') or 'completed'}"
+        return f"Activity ({turn_label})\n{item_type or 'item'}"
+
+    def render_user_message_item(self, item: dict[str, Any]) -> str:
+        content = item.get("content") if isinstance(item.get("content"), list) else []
+        parts = [self.render_user_input_part(part) for part in content if isinstance(part, dict)]
+        return "\n\n".join(part for part in parts if part).strip() or "(empty user message)"
+
+    @staticmethod
+    def render_user_input_part(part: dict[str, Any]) -> str:
+        part_type = part.get("type")
+        if part_type == "text":
+            return str(part.get("text") or "").strip()
+        if part_type == "localImage":
+            return f"[local image] {part.get('path')}"
+        if part_type == "image":
+            return f"[image] {part.get('url')}"
+        if part_type == "skill":
+            return f"[skill] {part.get('name')}: {part.get('path')}"
+        if part_type == "mention":
+            return f"[mention] {part.get('name')}: {part.get('path')}"
+        return f"[{part_type or 'input'}]"
+
+    def store_takeover_transcript(
+        self,
+        bot_key: str,
+        chat_id: str,
+        message_thread_id: int | None,
+        summary: str,
+        pages: list[str],
+    ) -> str:
+        transcript_id = rand_suffix(10)
+        created_at_ms = now_ms()
+
+        def mutate(data: dict[str, Any]) -> None:
+            transcripts = data.setdefault("takeover_transcripts", {})
+            transcripts[transcript_id] = {
+                "bot_key": bot_key,
+                "chat_id": chat_id,
+                "message_thread_id": message_thread_id,
+                "summary": summary,
+                "pages": pages,
+                "created_at_ms": created_at_ms,
+            }
+            if len(transcripts) <= TAKEOVER_MAX_STORED_TRANSCRIPTS:
+                return
+            ordered = sorted(
+                transcripts.items(),
+                key=lambda item: int(item[1].get("created_at_ms") or 0) if isinstance(item[1], dict) else 0,
+            )
+            for stale_id, _ in ordered[: max(0, len(ordered) - TAKEOVER_MAX_STORED_TRANSCRIPTS)]:
+                transcripts.pop(stale_id, None)
+
+        self.store.update(mutate)
+        return transcript_id
+
+    @staticmethod
+    def takeover_transcript_keyboard(transcript_id: str, *, view: str, page: int, page_count: int) -> dict[str, Any] | None:
+        if not transcript_id:
+            return None
+        if view == "details" and page_count > 0:
+            rows: list[list[dict[str, Any]]] = []
+            nav: list[dict[str, Any]] = []
+            if page > 0:
+                nav.append({"text": "Prev", "callback_data": f"t:page:{transcript_id}:{page - 1}"})
+            nav.append({"text": f"{page + 1}/{max(1, page_count)}", "callback_data": f"t:page:{transcript_id}:{page}"})
+            if page + 1 < page_count:
+                nav.append({"text": "Next", "callback_data": f"t:page:{transcript_id}:{page + 1}"})
+            rows.append(nav)
+            rows.append(
+                [
+                    {"text": "Summary", "callback_data": f"t:summary:{transcript_id}"},
+                    {"text": "Hide", "callback_data": f"t:hide:{transcript_id}"},
+                ]
+            )
+            return {"inline_keyboard": rows}
+        rows = [[{"text": "Hide", "callback_data": f"t:hide:{transcript_id}"}]]
+        if page_count > 0:
+            rows.insert(0, [{"text": "Details", "callback_data": f"t:details:{transcript_id}"}])
+        return {"inline_keyboard": rows}
+
+    def handle_takeover_transcript_callback(self, bot_key: str, bot: TelegramBot, callback: dict[str, Any]) -> None:
+        data = str(callback.get("data") or "")
+        parts = data.split(":")
+        cb_id = str(callback.get("id"))
+        if len(parts) < 3:
+            bot.answer_callback_query(cb_id, "Bad transcript action", show_alert=True)
+            return
+        _, action, transcript_id = parts[:3]
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        user = callback.get("from") if isinstance(callback.get("from"), dict) else {}
+        if not self.allowed(user, chat):
+            bot.answer_callback_query(cb_id, "Unauthorized", show_alert=True)
+            return
+        chat_id = str(chat.get("id", ""))
+        message_id = message.get("message_id")
+        if action == "hide":
+            bot.answer_callback_query(cb_id, "Hidden")
+            if chat_id and message_id:
+                bot.delete_message(chat_id, int(message_id))
+            return
+        transcript = self.store.snapshot().get("takeover_transcripts", {}).get(transcript_id)
+        if not isinstance(transcript, dict) or str(transcript.get("bot_key") or "") != bot_key:
+            bot.answer_callback_query(cb_id, "Transcript expired", show_alert=True)
+            return
+        pages = transcript.get("pages") if isinstance(transcript.get("pages"), list) else []
+        page = 0
+        view = "summary"
+        if action == "details":
+            view = "details"
+        elif action == "page":
+            view = "details"
+            if len(parts) >= 4:
+                try:
+                    page = max(0, int(parts[3]))
+                except ValueError:
+                    page = 0
+        elif action != "summary":
+            bot.answer_callback_query(cb_id, "Unknown transcript action", show_alert=True)
+            return
+        if view == "summary":
+            text = str(transcript.get("summary") or "CLI transcript")
+            markup = self.takeover_transcript_keyboard(transcript_id, view="summary", page=0, page_count=len(pages))
+        else:
+            if not pages:
+                bot.answer_callback_query(cb_id, "No transcript details available.", show_alert=True)
+                return
+            page = min(max(0, page), len(pages) - 1)
+            text = str(pages[page])
+            markup = self.takeover_transcript_keyboard(transcript_id, view="details", page=page, page_count=len(pages))
+        bot.answer_callback_query(cb_id)
+        if chat_id and message_id:
+            bot.edit_message_text(chat_id, int(message_id), text, reply_markup=markup)
+
+    def queue_takeover_message(
+        self,
+        bot_key: str,
+        message: dict[str, Any],
+        text: str,
+        input_items: list[dict[str, Any]],
+    ) -> tuple[bool, int]:
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        user = message.get("from") if isinstance(message.get("from"), dict) else {}
+        queued = {
+            "chat_id": str(chat.get("id", "")),
+            "message_thread_id": message.get("message_thread_id"),
+            "message_id": message.get("message_id"),
+            "user_id": str(user.get("id", "")),
+            "user_name": " ".join(str(user.get(key) or "").strip() for key in ("first_name", "last_name")).strip()
+            or str(user.get("username") or ""),
+            "text": text,
+            "input_items": input_items,
+            "created_at_ms": now_ms(),
+        }
+
+        def mutate(data: dict[str, Any]) -> int:
+            target = data["bots"].get(bot_key)
+            if not isinstance(target, dict):
+                return -1
+            takeover = target.get("takeover")
+            if not isinstance(takeover, dict) or takeover.get("status") != "active":
+                return -1
+            messages = takeover.setdefault("queued_messages", [])
+            if not isinstance(messages, list):
+                takeover["queued_messages"] = messages = []
+            if len(messages) >= TAKEOVER_MAX_QUEUED_MESSAGES:
+                return -1
+            messages.append(queued)
+            return len(messages)
+
+        count = self.store.update(mutate)
+        return count != -1, int(count if isinstance(count, int) else 0)
+
+    def replay_takeover_queued_messages(
+        self,
+        bot_key: str,
+        bot: TelegramBot,
+        fallback_chat_id: str,
+        fallback_message_thread_id: int | None,
+        queued_messages: list[Any],
+    ) -> None:
+        messages = [item for item in queued_messages if isinstance(item, dict)]
+        if not messages:
+            return
+        bot.send_message(
+            fallback_chat_id,
+            f"Sending {len(messages)} queued Telegram message(s) to Codex.",
+            message_thread_id=fallback_message_thread_id,
+        )
+        for queued in messages:
+            chat_id = str(queued.get("chat_id") or fallback_chat_id)
+            message_thread_id = queued.get("message_thread_id")
+            if message_thread_id is None:
+                message_thread_id = fallback_message_thread_id
+            text = str(queued.get("text") or "")
+            input_items = queued.get("input_items") if isinstance(queued.get("input_items"), list) else text_input(text)
+            fake_message = {
+                "message_id": queued.get("message_id"),
+                "chat": {"id": chat_id},
+                "message_thread_id": message_thread_id,
+            }
+            self.start_or_steer_turn(bot_key, bot, fake_message, text, input_items=input_items)
 
     def send_goal_replace_confirmation(
         self,
@@ -4084,7 +4838,12 @@ class MultiBotBridge:
             f"Approval: {approval_label(record.get('approval'))}",
             f"Work dir: {display_path(record.get('cwd') or 'default')}",
             f"Active turn: {record.get('active_turn_id') or 'none'}",
+            f"CLI takeover: {'active' if self.record_takeover_active(record) else 'off'}",
         ]
+        takeover = record.get("takeover") if isinstance(record.get("takeover"), dict) else {}
+        if self.record_takeover_active(record):
+            queued = takeover.get("queued_messages") if isinstance(takeover.get("queued_messages"), list) else []
+            lines.append(f"Queued Telegram messages: {len(queued)}")
         if active_flags:
             lines.append(f"Active flags: {', '.join(str(flag) for flag in active_flags)}")
         return "\n".join(
@@ -4100,6 +4859,10 @@ class MultiBotBridge:
         if not thread_id:
             return
         if self.thread_archived(thread_id):
+            if method == "turn/completed":
+                self.set_active_turn_by_thread(thread_id, None)
+            return
+        if self.thread_takeover_active(thread_id):
             if method == "turn/completed":
                 self.set_active_turn_by_thread(thread_id, None)
             return
